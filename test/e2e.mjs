@@ -9,7 +9,7 @@ const client = {
   tui: { showToast: async ({ body }) => toasts.push(body) },
 };
 
-const hooks = await RunStats({ client }, { title: "run stats", showLog: true, includeReasoning: true });
+const hooks = await RunStats({ client }, { title: "run stats", showLog: true, includeReasoning: true, format: "line" });
 
 const messageEvent = (id, cost, tokens, created) => ({
   event: {
@@ -41,22 +41,26 @@ assert.match(toasts[0].message, /10m/);
 console.log("e2e toast: " + toasts[0].message);
 console.log("title=" + toasts[0].title + " duration=" + toasts[0].duration + " logKeys=" + Object.keys(logs[0].extra).join(","));
 
-// rollup: only the root reports, summing spawned subagents
+// rollup, table: only the root reports, summing spawned subagents, labelled by agent + title
 const toasts2 = [];
 const c2 = { app: { log: async () => {} }, tui: { showToast: async ({ body }) => toasts2.push(body) } };
 const r = createTracker({ title: "run" }, c2);
-r.ingestSession({ id: "P", parentID: null });
-r.ingestSession({ id: "A", parentID: "P" });
-r.ingestSession({ id: "B", parentID: "P" });
-const mk = (sid, id, cost, input, output) => ({ sessionID: sid, id, role: "assistant", cost, tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } }, providerID: "p", modelID: "m", time: { created: 0 } });
-r.ingest(mk("P", "p1", 0.1, 100, 10));
-r.ingest(mk("A", "a1", 0.2, 200, 20));
-r.ingest(mk("B", "b1", 0.3, 300, 30));
+r.ingestSession({ id: "P", parentID: null, title: "Fix slope edges" });
+r.ingestSession({ id: "A", parentID: "P", title: "explore slope joins" });
+r.ingestSession({ id: "B", parentID: "P", title: "commit slope fix" });
+const mk = (sid, id, mode, cost, input, output) => ({ sessionID: sid, id, mode, role: "assistant", cost, tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } }, providerID: "p", modelID: "m", time: { created: 0 } });
+r.ingest(mk("P", "p1", "fusion-planner", 0.1, 100, 10));
+r.ingest(mk("A", "a1", "fusion-explorer", 0.2, 200, 20));
+r.ingest(mk("B", "b1", "fusion-ops", 0.3, 300, 30));
 assert.equal(await r.emit("A"), null); // subagent is silent
 assert.equal(await r.emit("B"), null);
 const rootLine = await r.emit("P");
+assert.match(rootLine, /agent\s+title\s+in\s+out\s+cache r\/w\s+cost\s+time/);
+assert.match(rootLine, /fusion-planner/);
+assert.match(rootLine, /fusion-explorer/);
+assert.match(rootLine, /Fix slope edges/);
+assert.match(rootLine, /TOTAL/);
 assert.match(rootLine, /\$0\.6000/);
-assert.match(rootLine, /in 600/);
 assert.equal(toasts2.length, 1);
-console.log("rollup toast: " + rootLine);
+console.log("rollup table:\n" + rootLine);
 

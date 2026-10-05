@@ -116,5 +116,41 @@ export function normalizeOptions(options = {}) {
     includeReasoning: options.includeReasoning === true,
     minCost: typeof options.minCost === "number" && options.minCost >= 0 ? options.minCost : 0,
     rollup: options.rollup !== false,
+    format: options.format === "line" ? "line" : "table",
+    maxTitle: typeof options.maxTitle === "number" && options.maxTitle > 0 ? options.maxTitle : 24,
   };
+}
+
+const pad = (s, w, right) => (right ? String(s).padStart(w) : String(s).padEnd(w));
+
+/**
+ * Aligned multi-line table. Numeric columns right-align; agent/title left.
+ * @param {Array<{agent?:string,title?:string,depth?:number,input:number,output:number,reasoning?:number,cacheRead:number,cacheWrite:number,cost:number,ms:number}>} rows
+ * @param {{includeReasoning?:boolean,maxTitle?:number,total?:object}} opts
+ */
+export function formatTable(rows, opts = {}) {
+  const maxTitle = opts.maxTitle || 24;
+  const clip = (s) => {
+    const t = String(s || "");
+    return t.length > maxTitle ? t.slice(0, Math.max(1, maxTitle - 1)) + "…" : t;
+  };
+  const cols = [
+    { key: "agent", head: "agent", right: false, val: (r) => "  ".repeat(r.depth || 0) + (r.agent || "?") },
+    { key: "title", head: "title", right: false, val: (r) => clip(r.title) },
+    { key: "in", head: "in", right: true, val: (r) => fmtTokens(r.input) },
+    { key: "out", head: "out", right: true, val: (r) => fmtTokens(r.output) },
+    { key: "cache", head: "cache r/w", right: true, val: (r) => `${fmtTokens(r.cacheRead)}/${fmtTokens(r.cacheWrite)}` },
+  ];
+  if (opts.includeReasoning) cols.push({ key: "reason", head: "reason", right: true, val: (r) => fmtTokens(r.reasoning) });
+  cols.push({ key: "cost", head: "cost", right: true, val: (r) => fmtUsd(r.cost) });
+  cols.push({ key: "time", head: "time", right: true, val: (r) => fmtDuration(r.ms) });
+
+  const all = opts.total ? [...rows, { agent: "TOTAL", title: "", depth: 0, ...opts.total }] : rows;
+  const widths = cols.map((c) => Math.max(c.head.length, ...all.map((r) => String(c.val(r)).length)));
+  const line = (r) => cols.map((c, i) => pad(c.val(r), widths[i], c.right)).join("  ").trimEnd();
+  const header = cols.map((c, i) => pad(c.head, widths[i], c.right)).join("  ").trimEnd();
+  const sep = widths.map((w) => "─".repeat(w)).join("  ");
+  const body = [header, sep, ...rows.map(line)];
+  if (opts.total) body.push(sep, line({ agent: "TOTAL", depth: 0, ...opts.total }));
+  return body.join("\n");
 }

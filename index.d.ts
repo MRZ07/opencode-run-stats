@@ -15,6 +15,10 @@ export interface RunStatsOptions extends PluginOptions {
   minCost?: number;
   /** Only the root session reports, summing spawned subagents. Default: true */
   rollup?: boolean;
+  /** Output shape. Default: "table" */
+  format?: "table" | "line";
+  /** Max title column width in the table. Default: 24 */
+  maxTitle?: number;
 }
 
 export interface RunStats {
@@ -35,6 +39,10 @@ export declare function fmtUsd(n: number): string;
 export declare function summarize(s: unknown): RunStats;
 export declare function summarizeMany(list: unknown[]): RunStats;
 export declare function formatLine(s: RunStats & { includeReasoning?: boolean }): string;
+export declare function formatTable(
+  rows: Array<Partial<RunStats> & { agent?: string; title?: string; depth?: number }>,
+  opts?: { includeReasoning?: boolean; maxTitle?: number; total?: Partial<RunStats> },
+): string;
 export declare function formatBlock(s: RunStats): string;
 export declare function normalizeOptions(options?: PluginOptions): Required<RunStatsOptions>;
 

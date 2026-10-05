@@ -3,10 +3,15 @@
 Print a run's token, cost and time summary when it ends. Computed from opencode events — it never asks the model.
 
 ```
-in 5k · out 600 · cache 250k read / 3k write · $1.20 · 5m12s
+agent              title                 in  out  cache r/w     cost  time
+─────────────────  ───────────────────  ───  ───  ─────────  ───────  ────
+fusion-planner     Fix slope edges      12k  4.5k    1.2M/8k    $1.20  5m12s
+  fusion-explorer  explore slope joins   3k   900    200k/2k  $0.0500     1m
+─────────────────  ───────────────────  ───  ───  ─────────  ───────  ────
+TOTAL                                   15k  5.4k   1.4M/10k    $1.25  5m12s
 ```
 
-Shown as a toast (and optionally a log line) when the session goes idle.
+One row per session (parent + spawned subagents), labelled by agent and session title, plus a total. Shown as a toast (and optionally a log line) when the session goes idle.
 
 ## Install
 
@@ -46,14 +51,16 @@ Local install (both versions): copy `dist/opencode-run-stats.js` into `~/.config
 | `includeReasoning` | `false` | add reasoning tokens to the line |
 | `minCost` | `0` | skip sessions cheaper than this USD (quiets subagent noise) |
 | `rollup` | `true` | root session reports the whole tree; subagents stay silent |
+| `format` | `"table"` | `table` or `line` |
+| `maxTitle` | `24` | max title column width |
 
 Env: `OPENCODE_RUN_STATS_CONFIG`.
 
 ## What it counts
 
-Sums the session's assistant messages: `cost`, `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read` (cache hits) and `tokens.cache.write`. Time is first to last assistant message. It prints once per idle and reprints only when the totals change; costless sessions are skipped.
+Sums each session's assistant messages: `cost`, `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read` (cache hits) and `tokens.cache.write`. Rows are labelled by the message `mode` (agent name) and the session title; subagent rows are indented. Time is first to last assistant message. It prints once per idle and reprints only when the totals change; costless sessions are skipped.
 
-With `rollup` (default) the **root** session prints the total across the whole run — every spawned subagent included, matched through the session tree (`parentID`) — and subagent sessions stay silent. Set `rollup: false` for one line per session.
+With `rollup` (default) the **root** session prints the total across the whole run — every spawned subagent included, matched through the session tree (`parentID`) — and subagent sessions stay silent. Set `rollup: false` for one table row per session. `format: "line"` prints a single compact line instead of the table.
 
 ## Compatibility
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { fmtTokens, fmtDuration, fmtUsd, summarize, formatLine } from "../lib.js";
+import { fmtTokens, fmtDuration, fmtUsd, summarize, formatLine, formatTable } from "../lib.js";
 import { createTracker } from "../tracker.js";
 
 // formatting
@@ -27,7 +27,7 @@ assert.match(formatLine(sum), /cache 7k read \/ 100 write/);
 const toasts = [];
 const logs = [];
 const client = { app: { log: async ({ body }) => logs.push(body) }, tui: { showToast: async ({ body }) => toasts.push(body) } };
-const t = createTracker({ title: "stats", showLog: true }, client);
+const t = createTracker({ title: "stats", showLog: true, format: "line" }, client);
 const msg = (id, cost, tokens, created) => ({
   sessionID: "s", id, role: "assistant", cost, tokens,
   providerID: "github-copilot", modelID: "gpt-6-luna", time: { created },
@@ -47,5 +47,21 @@ assert.equal(await t.emit("s"), null); // unchanged -> no repeat
 const t2 = createTracker({}, client);
 t2.ingest(msg("z", 0, { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, 0));
 assert.equal(await t2.emit("s"), null);
+
+// table formatting
+{
+  const table = formatTable(
+    [
+      { agent: "fusion-planner", title: "Fix slope edges", depth: 0, input: 12000, output: 4500, cacheRead: 1200000, cacheWrite: 8000, cost: 1.2, ms: 312000 },
+      { agent: "fusion-ops", title: "commit slope fix", depth: 1, input: 3000, output: 900, cacheRead: 200000, cacheWrite: 2000, cost: 0.05, ms: 60000 },
+    ],
+    { total: { input: 15000, output: 5400, cacheRead: 1400000, cacheWrite: 10000, cost: 1.25, ms: 312000 } },
+  );
+  assert.match(table, /agent\s+title\s+in\s+out\s+cache r\/w\s+cost\s+time/);
+  assert.match(table, /fusion-planner/);
+  assert.match(table, /\n\s*fusion-ops/); // indented subagent
+  assert.match(table, /TOTAL/);
+  assert.match(table, /\$1\.25/);
+}
 
 console.log("smoke: all assertions passed");
