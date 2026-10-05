@@ -56,7 +56,8 @@ function normalizeOptions(options = {}) {
     showLog: options.showLog === true,
     title: typeof options.title === "string" && options.title ? options.title : "run stats",
     toastDuration: typeof options.toastDuration === "number" && options.toastDuration > 0 ? options.toastDuration : 8000,
-    includeReasoning: options.includeReasoning === true
+    includeReasoning: options.includeReasoning === true,
+    minCost: typeof options.minCost === "number" && options.minCost >= 0 ? options.minCost : 0
   };
 }
 
@@ -94,6 +95,8 @@ function createTracker(options, client) {
     if (sum.turns === 0)
       return null;
     if (sum.cost === 0 && sum.input === 0 && sum.output === 0)
+      return null;
+    if (sum.cost < cfg.minCost)
       return null;
     const key = [sum.turns, sum.cost, sum.input, sum.output, sum.cacheRead, sum.cacheWrite, sum.ms].join("|");
     if (s.printedKey === key)

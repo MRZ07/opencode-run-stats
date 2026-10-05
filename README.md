@@ -44,6 +44,7 @@ Local install (both versions): copy `dist/opencode-run-stats.js` into `~/.config
 | `title` | `"run stats"` | toast title |
 | `toastDuration` | `8000` | toast duration in ms |
 | `includeReasoning` | `false` | add reasoning tokens to the line |
+| `minCost` | `0` | skip sessions cheaper than this USD (quiets subagent noise) |
 
 Env: `OPENCODE_RUN_STATS_CONFIG`.
 

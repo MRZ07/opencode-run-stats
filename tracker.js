@@ -41,6 +41,7 @@ export function createTracker(options, client) {
     const sum = summarize(s);
     if (sum.turns === 0) return null;
     if (sum.cost === 0 && sum.input === 0 && sum.output === 0) return null;
+    if (sum.cost < cfg.minCost) return null;
 
     const key = [sum.turns, sum.cost, sum.input, sum.output, sum.cacheRead, sum.cacheWrite, sum.ms].join("|");
     if (s.printedKey === key) return null;

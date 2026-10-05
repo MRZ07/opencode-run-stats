@@ -96,5 +96,6 @@ export function normalizeOptions(options = {}) {
     title: typeof options.title === "string" && options.title ? options.title : "run stats",
     toastDuration: typeof options.toastDuration === "number" && options.toastDuration > 0 ? options.toastDuration : 8000,
     includeReasoning: options.includeReasoning === true,
+    minCost: typeof options.minCost === "number" && options.minCost >= 0 ? options.minCost : 0,
   };
 }

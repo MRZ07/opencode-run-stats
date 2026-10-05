@@ -11,6 +11,8 @@ export interface RunStatsOptions extends PluginOptions {
   toastDuration?: number;
   /** Include reasoning tokens in the line. Default: false */
   includeReasoning?: boolean;
+  /** Skip sessions cheaper than this many USD (reduces noise from subagents). Default: 0 */
+  minCost?: number;
 }
 
 export interface RunStats {
