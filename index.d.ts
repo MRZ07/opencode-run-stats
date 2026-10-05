@@ -13,6 +13,8 @@ export interface RunStatsOptions extends PluginOptions {
   includeReasoning?: boolean;
   /** Skip sessions cheaper than this many USD (reduces noise from subagents). Default: 0 */
   minCost?: number;
+  /** Only the root session reports, summing spawned subagents. Default: true */
+  rollup?: boolean;
 }
 
 export interface RunStats {
@@ -31,6 +33,7 @@ export declare function fmtTokens(n: number): string;
 export declare function fmtDuration(ms: number): string;
 export declare function fmtUsd(n: number): string;
 export declare function summarize(s: unknown): RunStats;
+export declare function summarizeMany(list: unknown[]): RunStats;
 export declare function formatLine(s: RunStats & { includeReasoning?: boolean }): string;
 export declare function formatBlock(s: RunStats): string;
 export declare function normalizeOptions(options?: PluginOptions): Required<RunStatsOptions>;

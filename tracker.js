@@ -2,15 +2,17 @@
  * opencode-run-stats — stateful tracker.
  *
  * Aggregates assistant-message tokens/cost per session and, when a run goes
- * idle, emits a one-line summary. Kept separate from index.js so the plugin
- * file exports only the plugin function.
+ * idle, emits a one-line summary. With `rollup` (default) only the root
+ * session emits, summing the whole session tree (parent + spawned subagents).
  */
-import { summarize, formatLine, normalizeOptions } from "./lib.js";
+import { summarize, summarizeMany, formatLine, normalizeOptions } from "./lib.js";
 
 export function createTracker(options, client) {
   const cfg = normalizeOptions(options);
   /** @type {Map<string, {messages: Map<string,{cost:number,tokens:any}>, first?:number, last?:number, models:Set<string>, printedKey:?string}>} */
   const sessions = new Map();
+  /** child sessionID -> parent sessionID (or null for roots) */
+  const parents = new Map();
 
   const get = (id) => {
     let s = sessions.get(id);
@@ -19,6 +21,11 @@ export function createTracker(options, client) {
       sessions.set(id, s);
     }
     return s;
+  };
+
+  /** @param {{id:string, parentID?:string|null}} info */
+  const ingestSession = (info) => {
+    if (info && info.id) parents.set(info.id, info.parentID ?? null);
   };
 
   const ingest = (info) => {
@@ -35,15 +42,35 @@ export function createTracker(options, client) {
     }
   };
 
+  /** Root plus every descendant session of `root`. */
+  const treeOf = (root) => {
+    const out = [root];
+    const stack = [root];
+    while (stack.length) {
+      const cur = stack.pop();
+      for (const [id, pid] of parents) {
+        if (pid === cur) {
+          out.push(id);
+          stack.push(id);
+        }
+      }
+    }
+    return out;
+  };
+
   const emit = async (sessionID) => {
-    const s = sessions.get(sessionID);
-    if (!s) return null;
-    const sum = summarize(s);
+    const isSubagent = parents.get(sessionID) != null;
+    if (cfg.rollup && isSubagent) return null; // only the root session reports; subagents stay silent
+
+    const ids = cfg.rollup ? treeOf(sessionID) : [sessionID];
+    const sum = summarizeMany(ids.map((id) => sessions.get(id)).filter(Boolean));
+
     if (sum.turns === 0) return null;
     if (sum.cost === 0 && sum.input === 0 && sum.output === 0) return null;
     if (sum.cost < cfg.minCost) return null;
 
     const key = [sum.turns, sum.cost, sum.input, sum.output, sum.cacheRead, sum.cacheWrite, sum.ms].join("|");
+    const s = get(sessionID);
     if (s.printedKey === key) return null;
     s.printedKey = key;
 
@@ -68,7 +95,10 @@ export function createTracker(options, client) {
     return line;
   };
 
-  const forget = (id) => sessions.delete(id);
+  const forget = (id) => {
+    sessions.delete(id);
+    parents.delete(id);
+  };
 
-  return { ingest, emit, forget, _sessions: sessions, _cfg: cfg };
+  return { ingest, ingestSession, emit, forget, _sessions: sessions, _parents: parents, _cfg: cfg };
 }

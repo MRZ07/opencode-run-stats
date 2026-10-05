@@ -38,6 +38,24 @@ function summarize(s) {
   const ms = s.first != null && s.last != null ? Math.max(0, s.last - s.first) : 0;
   return { cost, ...t, ms, turns, model: [...s.models || []].join(", ") || null };
 }
+function summarizeMany(list) {
+  const acc = { messages: new Map, first: undefined, last: undefined, models: new Set };
+  let i = 0;
+  for (const s of list) {
+    if (!s)
+      continue;
+    for (const [k, v] of s.messages)
+      acc.messages.set(`${i}:${k}`, v);
+    if (s.first != null)
+      acc.first = acc.first == null ? s.first : Math.min(acc.first, s.first);
+    if (s.last != null)
+      acc.last = acc.last == null ? s.last : Math.max(acc.last, s.last);
+    for (const m of s.models || [])
+      acc.models.add(m);
+    i++;
+  }
+  return summarize(acc);
+}
 function formatLine(s) {
   const parts = [
     `in ${fmtTokens(s.input)}`,
@@ -57,7 +75,8 @@ function normalizeOptions(options = {}) {
     title: typeof options.title === "string" && options.title ? options.title : "run stats",
     toastDuration: typeof options.toastDuration === "number" && options.toastDuration > 0 ? options.toastDuration : 8000,
     includeReasoning: options.includeReasoning === true,
-    minCost: typeof options.minCost === "number" && options.minCost >= 0 ? options.minCost : 0
+    minCost: typeof options.minCost === "number" && options.minCost >= 0 ? options.minCost : 0,
+    rollup: options.rollup !== false
   };
 }
 
@@ -65,6 +84,7 @@ function normalizeOptions(options = {}) {
 function createTracker(options, client) {
   const cfg = normalizeOptions(options);
   const sessions = new Map;
+  const parents = new Map;
   const get = (id) => {
     let s = sessions.get(id);
     if (!s) {
@@ -72,6 +92,10 @@ function createTracker(options, client) {
       sessions.set(id, s);
     }
     return s;
+  };
+  const ingestSession = (info) => {
+    if (info && info.id)
+      parents.set(info.id, info.parentID ?? null);
   };
   const ingest = (info) => {
     const s = get(info.sessionID);
@@ -87,11 +111,26 @@ function createTracker(options, client) {
       s.last = s.last == null ? created : Math.max(s.last, created);
     }
   };
+  const treeOf = (root) => {
+    const out = [root];
+    const stack = [root];
+    while (stack.length) {
+      const cur = stack.pop();
+      for (const [id, pid] of parents) {
+        if (pid === cur) {
+          out.push(id);
+          stack.push(id);
+        }
+      }
+    }
+    return out;
+  };
   const emit = async (sessionID) => {
-    const s = sessions.get(sessionID);
-    if (!s)
+    const isSubagent = parents.get(sessionID) != null;
+    if (cfg.rollup && isSubagent)
       return null;
-    const sum = summarize(s);
+    const ids = cfg.rollup ? treeOf(sessionID) : [sessionID];
+    const sum = summarizeMany(ids.map((id) => sessions.get(id)).filter(Boolean));
     if (sum.turns === 0)
       return null;
     if (sum.cost === 0 && sum.input === 0 && sum.output === 0)
@@ -99,6 +138,7 @@ function createTracker(options, client) {
     if (sum.cost < cfg.minCost)
       return null;
     const key = [sum.turns, sum.cost, sum.input, sum.output, sum.cacheRead, sum.cacheWrite, sum.ms].join("|");
+    const s = get(sessionID);
     if (s.printedKey === key)
       return null;
     s.printedKey = key;
@@ -117,8 +157,11 @@ function createTracker(options, client) {
     }
     return line;
   };
-  const forget = (id) => sessions.delete(id);
-  return { ingest, emit, forget, _sessions: sessions, _cfg: cfg };
+  const forget = (id) => {
+    sessions.delete(id);
+    parents.delete(id);
+  };
+  return { ingest, ingestSession, emit, forget, _sessions: sessions, _parents: parents, _cfg: cfg };
 }
 
 // index.js
@@ -142,6 +185,8 @@ var RunStats = async ({ client }, options) => {
         const info = event.properties.info;
         if (info.role === "assistant")
           tracker.ingest(info);
+      } else if (event.type === "session.created" || event.type === "session.updated") {
+        tracker.ingestSession(event.properties.info);
       } else if (event.type === "session.idle") {
         await tracker.emit(event.properties.sessionID);
       } else if (event.type === "session.deleted") {

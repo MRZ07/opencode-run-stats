@@ -33,6 +33,8 @@ export const RunStats = async ({ client }, options) => {
       if (event.type === "message.updated") {
         const info = event.properties.info;
         if (info.role === "assistant") tracker.ingest(info);
+      } else if (event.type === "session.created" || event.type === "session.updated") {
+        tracker.ingestSession(event.properties.info);
       } else if (event.type === "session.idle") {
         await tracker.emit(event.properties.sessionID);
       } else if (event.type === "session.deleted") {

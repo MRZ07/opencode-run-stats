@@ -45,12 +45,15 @@ Local install (both versions): copy `dist/opencode-run-stats.js` into `~/.config
 | `toastDuration` | `8000` | toast duration in ms |
 | `includeReasoning` | `false` | add reasoning tokens to the line |
 | `minCost` | `0` | skip sessions cheaper than this USD (quiets subagent noise) |
+| `rollup` | `true` | root session reports the whole tree; subagents stay silent |
 
 Env: `OPENCODE_RUN_STATS_CONFIG`.
 
 ## What it counts
 
 Sums the session's assistant messages: `cost`, `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read` (cache hits) and `tokens.cache.write`. Time is first to last assistant message. It prints once per idle and reprints only when the totals change; costless sessions are skipped.
+
+With `rollup` (default) the **root** session prints the total across the whole run — every spawned subagent included, matched through the session tree (`parentID`) — and subagent sessions stay silent. Set `rollup: false` for one line per session.
 
 ## Compatibility
 

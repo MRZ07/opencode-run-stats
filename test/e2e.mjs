@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { RunStats } from "../index.js";
+import { createTracker } from "../tracker.js";
 
 const toasts = [];
 const logs = [];
@@ -39,3 +40,23 @@ assert.match(toasts[0].message, /reason 500/);
 assert.match(toasts[0].message, /10m/);
 console.log("e2e toast: " + toasts[0].message);
 console.log("title=" + toasts[0].title + " duration=" + toasts[0].duration + " logKeys=" + Object.keys(logs[0].extra).join(","));
+
+// rollup: only the root reports, summing spawned subagents
+const toasts2 = [];
+const c2 = { app: { log: async () => {} }, tui: { showToast: async ({ body }) => toasts2.push(body) } };
+const r = createTracker({ title: "run" }, c2);
+r.ingestSession({ id: "P", parentID: null });
+r.ingestSession({ id: "A", parentID: "P" });
+r.ingestSession({ id: "B", parentID: "P" });
+const mk = (sid, id, cost, input, output) => ({ sessionID: sid, id, role: "assistant", cost, tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } }, providerID: "p", modelID: "m", time: { created: 0 } });
+r.ingest(mk("P", "p1", 0.1, 100, 10));
+r.ingest(mk("A", "a1", 0.2, 200, 20));
+r.ingest(mk("B", "b1", 0.3, 300, 30));
+assert.equal(await r.emit("A"), null); // subagent is silent
+assert.equal(await r.emit("B"), null);
+const rootLine = await r.emit("P");
+assert.match(rootLine, /\$0\.6000/);
+assert.match(rootLine, /in 600/);
+assert.equal(toasts2.length, 1);
+console.log("rollup toast: " + rootLine);
+

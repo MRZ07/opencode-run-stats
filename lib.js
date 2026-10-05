@@ -53,6 +53,24 @@ export function summarize(s) {
 }
 
 /**
+ * Sum several sessions (a run's session tree) into one stat object.
+ * @param {Array<{messages: Map<string,{cost:number,tokens:any}>, first?:number, last?:number, models?:Set<string>}>} list
+ */
+export function summarizeMany(list) {
+  const acc = { messages: new Map(), first: undefined, last: undefined, models: new Set() };
+  let i = 0;
+  for (const s of list) {
+    if (!s) continue;
+    for (const [k, v] of s.messages) acc.messages.set(`${i}:${k}`, v);
+    if (s.first != null) acc.first = acc.first == null ? s.first : Math.min(acc.first, s.first);
+    if (s.last != null) acc.last = acc.last == null ? s.last : Math.max(acc.last, s.last);
+    for (const m of s.models || []) acc.models.add(m);
+    i++;
+  }
+  return summarize(acc);
+}
+
+/**
  * One-line summary. Example:
  * "in 12.3k · out 4.5k · cache 1.2M read / 8k write · $2.34 · 5m12s"
  * @param {ReturnType<typeof summarize> & {includeReasoning?:boolean}} s
@@ -97,5 +115,6 @@ export function normalizeOptions(options = {}) {
     toastDuration: typeof options.toastDuration === "number" && options.toastDuration > 0 ? options.toastDuration : 8000,
     includeReasoning: options.includeReasoning === true,
     minCost: typeof options.minCost === "number" && options.minCost >= 0 ? options.minCost : 0,
+    rollup: options.rollup !== false,
   };
 }
