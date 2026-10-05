@@ -1,0 +1,32 @@
+{
+  "name": "opencode-run-stats",
+  "version": "0.1.0",
+  "description": "opencode plugin: at the end of a run, print input/output tokens, cache read/write, cost in USD and time — computed from events, no model call.",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "types": "./index.d.ts"
+    }
+  },
+  "files": ["index.js", "tracker.js", "lib.js", "index.d.ts", "dist", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node test/smoke.mjs",
+    "build:local": "node build-local.mjs"
+  },
+  "keywords": ["opencode", "opencode-plugin", "tokens", "cost", "stats", "usage"],
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
