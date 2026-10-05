@@ -1,7 +1,7 @@
 {
   "name": "opencode-run-stats",
-  "version": "0.3.1",
-  "description": "opencode plugin: at the end of a run, print input/output tokens, cache read/write, cost in USD and time — computed from events, no model call.",
+  "version": "0.4.0",
+  "description": "opencode plugin: print run token, cost and time stats, with exact post-idle cost backfill for standalone Deep Review reports.",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
@@ -11,9 +11,9 @@
       "types": "./index.d.ts"
     }
   },
-  "files": ["index.js", "tracker.js", "lib.js", "index.d.ts", "dist", "README.md", "LICENSE"],
+  "files": ["index.js", "tracker.js", "lib.js", "deep-review.js", "index.d.ts", "dist", "README.md", "LICENSE"],
   "scripts": {
-    "test": "node test/smoke.mjs",
+    "test": "node test/smoke.mjs && node test/deep-review.mjs",
     "build:local": "node build-local.mjs"
   },
   "keywords": ["opencode", "opencode-plugin", "tokens", "cost", "stats", "usage"],

@@ -45,6 +45,10 @@ Options, v1 tuple / v2 object:
 
 Local install (both versions): copy `dist/opencode-run-stats.js` into `~/.config/opencode/plugins/` and configure with `~/.config/opencode/run-stats.json`.
 
+## Deep Review report costs
+
+For a standalone Deep Review v3 report written by the root session, the plugin backfills the `cost` JSON and `Run Costs` section after `session.idle`. It uses OpenCode's final assistant-message usage through that idle, including the closing response after the report's `ended_at`. The report's declared helper IDs must match trusted task metadata from the root session, and each helper must verify as its child. Only a pending report or a matching `fusion-ops-db` snapshot is updated; ambiguous history or missing usage stays pending. The plugin records `source: "opencode-run-stats"` and the exact session IDs/cutoff. This post-idle update is independent of `minCost`, `showToast`, and `showLog`.
+
 ## Config
 
 | Option | Default | Meaning |
@@ -74,7 +78,7 @@ v1 (`plugin`) and v2 (`plugins`) share the hook API. Local installs load from `~
 ## Test
 
 ```bash
-node test/smoke.mjs && node test/e2e.mjs
+npm test && node test/e2e.mjs
 ```
 
 ## License

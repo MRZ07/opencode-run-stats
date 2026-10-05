@@ -8,6 +8,7 @@
  * function in a plugin file as a plugin, so helper logic lives in ./lib.js.
  */
 import { createTracker } from "./tracker.js";
+import { reportPathsFromTool, updateDeepReviewReport } from "./deep-review.js";
 
 /** Optional config file for local installs, where the plugin tuple can't pass options. */
 async function loadFileOptions() {
@@ -27,6 +28,7 @@ async function loadFileOptions() {
 export const RunStats = async ({ client }, options) => {
   const fileOptions = await loadFileOptions();
   const tracker = createTracker({ ...(fileOptions || {}), ...(options || {}) }, client);
+  const reportPaths = new Map();
 
   return {
     event: async ({ event }) => {
@@ -36,10 +38,26 @@ export const RunStats = async ({ client }, options) => {
       } else if (event.type === "session.created" || event.type === "session.updated") {
         tracker.ingestSession(event.properties.info);
       } else if (event.type === "session.idle") {
-        await tracker.emit(event.properties.sessionID);
+        const sessionID = event.properties.sessionID;
+        const idleAt = Date.now();
+        await tracker.emit(sessionID);
+        const paths = reportPaths.get(sessionID);
+        reportPaths.delete(sessionID); // one idle window per trusted report-write binding
+        for (const filePath of paths || []) {
+          await updateDeepReviewReport({ client, rootId: sessionID, filePath, idleAt });
+        }
       } else if (event.type === "session.deleted") {
-        tracker.forget(event.properties.info.id);
+        const sessionID = event.properties.info.id;
+        tracker.forget(sessionID);
+        reportPaths.delete(sessionID);
       }
+    },
+    "tool.execute.after": async ({ tool, sessionID, args }, output) => {
+      const paths = reportPathsFromTool(tool, args, output);
+      if (!paths.length || !sessionID) return;
+      const current = reportPaths.get(sessionID) || new Set();
+      for (const filePath of paths) current.add(filePath);
+      reportPaths.set(sessionID, current);
     },
   };
 };
