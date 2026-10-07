@@ -9,7 +9,7 @@
  */
 import { createTracker } from "./tracker.js";
 import { reportPathsFromTool, updateDeepReviewReport } from "./deep-review.js";
-import { projectKey } from "./accounting.js";
+import { projectKey, appendSubagentCheckpoints } from "./accounting.js";
 let z;
 try { ({ z } = await import("zod")); } catch { z = null; }
 const toolArgs = z ? {
@@ -62,12 +62,26 @@ export const RunStats = async ({ client, directory }, options) => {
             const targetResult = await client.session?.get?.({ path: { id: requested } });
             const validResponse = (response, id) => response && !response.error && response.data?.id === id &&
               typeof (response.data.projectID || response.data.directory) === "string";
-            if (!validResponse(currentResult, context.sessionID) || !validResponse(targetResult, requested)) throw new Error("run-stats: selector requires successful session metadata with project identity");
+            if (!validResponse(currentResult, context.sessionID) || !validResponse(targetResult, requested) ||
+              typeof currentResult.data.directory !== "string" || typeof targetResult.data.directory !== "string")
+              throw new Error("run-stats: selector requires successful session metadata with project identity and directory");
             const currentProject = currentResult.data.projectID || currentResult.data.directory;
             const targetProject = targetResult.data.projectID || targetResult.data.directory;
-            if (currentProject !== targetProject) throw new Error("run-stats: selected session belongs to another OpenCode project");
+            if (currentProject !== targetProject || await projectKey(currentResult.data.directory) !== await projectKey(projectDirectory) ||
+              await projectKey(targetResult.data.directory) !== await projectKey(projectDirectory))
+              throw new Error("run-stats: selected session belongs to another OpenCode project");
           }
           await tracker.ready;
+          if (requested && requested !== context.sessionID) {
+            const currentResult = await client.session?.get?.({ path: { id: context.sessionID } });
+            const targetResult = await client.session?.get?.({ path: { id: requested } });
+            if (!currentResult?.data || !targetResult?.data || currentResult.data.id !== context.sessionID || targetResult.data.id !== requested ||
+              typeof currentResult.data.directory !== "string" || typeof targetResult.data.directory !== "string")
+              throw new Error("run-stats: selected session ancestry requires verified caller and target metadata");
+            await tracker.ingestSession(currentResult.data);
+            await tracker.ingestSession(targetResult.data);
+            await tracker.recoverVerifiedAncestry(requested);
+          }
           await tracker.refresh();
           await tracker.refreshGuardConfig();
           const reportSession = requested || context.sessionID;
@@ -99,6 +113,11 @@ export const RunStats = async ({ client, directory }, options) => {
       }
     },
     "tool.execute.after": async ({ tool, sessionID, args }, output) => {
+      if (tool === "task" && sessionID) {
+        await tracker.refresh(); await tracker.refreshGuardConfig();
+        const entries = await tracker.checkpointEntries(sessionID);
+        if (entries.length && output && typeof output === "object") output.output = appendSubagentCheckpoints(output.output, entries);
+      }
       const paths = reportPathsFromTool(tool, args, output);
       if (!paths.length || !sessionID) return;
       const current = reportPaths.get(sessionID) || new Set();

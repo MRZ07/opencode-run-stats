@@ -29,7 +29,8 @@ assert.match(formatLine(sum), /cache 7k read \/ 100 write/);
 const toasts = [];
 const logs = [];
 const client = { app: { log: async ({ body }) => logs.push(body) }, tui: { showToast: async ({ body }) => toasts.push(body) } };
-const t = createTracker(noPersist({ title: "stats", showLog: true, format: "line" }), client);
+  const t = createTracker(noPersist({ title: "stats", showLog: true, format: "line" }), client, () => Date.now(), process.cwd());
+  await t.ingestSession({ id: "s", parentID: null, directory: process.cwd() });
 const msg = (id, cost, tokens, created) => ({
   sessionID: "s", id, role: "assistant", cost, tokens,
   providerID: "github-copilot", modelID: "gpt-6-luna", time: { created },
@@ -46,7 +47,8 @@ assert.equal(logs.length, 1);
 assert.equal(await t.emit("s"), null); // unchanged -> no repeat
 
 // costless session is skipped
-const t2 = createTracker(noPersist(), client);
+const t2 = createTracker(noPersist(), client, () => Date.now(), process.cwd());
+await t2.ingestSession({ id: "s", parentID: null, directory: process.cwd() });
 t2.ingest(msg("z", 0, { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, 0));
 assert.equal(await t2.emit("s"), null);
 

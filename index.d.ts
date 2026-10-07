@@ -2,8 +2,13 @@ import type { Plugin, PluginOptions } from "@opencode-ai/plugin";
 
 export interface GuardBudget {
   available: boolean; appliesToSession?: boolean; excludedFromSessionBudget?: boolean;
+  subagentCapAvailable?: boolean; activeTokenDimensions?: { legacySession: number | null; subagent: number | null; effectiveSession: number | null };
   extensions?: { sessionUsd: number; sessionTokens: number; runUsd: number; runTokens: number };
   costAvailable?: boolean; knownCostLowerBound?: number; sessionBudgetAvailable?: boolean; runBudgetAvailable?: boolean;
+  attributionComplete?: boolean; attributionReason?: string | null; subagentApplicable?: boolean;
+  subagentAttributionComplete?: boolean; subagentAttributionReason?: string | null;
+  subagentBaseLimit?: number | null; subagentEffectiveLimit?: number | null;
+  legacyTokenLimit?: number | null; effectiveSessionTokenLimit?: number | null;
   runUsdLimit?: number | null; runUsdRemaining?: number | null; runUsdOverage?: number | null;
   sessionUsdLimit?: number | null; sessionUsdRemaining?: number | null; sessionUsdOverage?: number | null;
   runTokenLimit?: number | null; runTokensRemaining?: number | null; sessionTokenLimit?: number | null; sessionTokensRemaining?: number | null;
@@ -19,8 +24,9 @@ export interface RunStatsReport {
   input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number; totalTokens: number; turns: number;
   first: number | null; last: number | null; models: Set<string>; messageSpanMs: number; runElapsedMs: number;
   historyCoverage: string; guardBudget: GuardBudget; guardSessionBudget: GuardSessionBudget;
+  subagentAttributionComplete: boolean; subagentAttributionReason: string | null;
 }
-export interface GuardSessionBudget extends Pick<GuardBudget, "available" | "appliesToSession" | "excludedFromSessionBudget" | "extensions" | "costAvailable" | "knownCostLowerBound" | "sessionUsdLimit" | "sessionUsdRemaining" | "sessionUsdOverage" | "sessionTokenLimit" | "sessionTokensRemaining" | "sessionBudgetAvailable"> {}
+export interface GuardSessionBudget extends Pick<GuardBudget, "available" | "appliesToSession" | "excludedFromSessionBudget" | "extensions" | "costAvailable" | "knownCostLowerBound" | "attributionComplete" | "attributionReason" | "sessionUsdLimit" | "sessionUsdRemaining" | "sessionUsdOverage" | "sessionTokenLimit" | "sessionTokensRemaining" | "sessionBudgetAvailable" | "subagentApplicable" | "subagentBaseLimit" | "subagentEffectiveLimit" | "subagentCapAvailable" | "activeTokenDimensions" | "legacyTokenLimit" | "effectiveSessionTokenLimit"> {}
 export interface RunStatsOptions extends Partial<PluginOptions> {
   showToast?: boolean; showLog?: boolean; title?: string; toastDuration?: number; includeReasoning?: boolean;
   minCost?: number; rollup?: boolean; format?: "table" | "line"; maxTitle?: number; scope?: "run" | "session";

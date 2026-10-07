@@ -9,7 +9,7 @@ const client = {
   tui: { showToast: async ({ body }) => toasts.push(body) },
 };
 
-const hooks = await RunStats({ client }, { title: "run stats", showLog: true, includeReasoning: true, format: "line" });
+const hooks = await RunStats({ client, directory: { worktree: process.cwd() } }, { title: "run stats", showLog: true, includeReasoning: true, format: "line" });
 const config = { command: { "run-stats": { description: "user override" } } };
 await hooks.config(config);
 assert.equal(config.command["run-stats"].description, "user override");
@@ -35,6 +35,7 @@ const messageEvent = (id, cost, tokens, created) => ({
   },
 });
 
+await hooks.event({ event: { type: "session.created", properties: { info: { id: "s", parentID: null, directory: process.cwd() } } } });
 await hooks.event(messageEvent("m1", 0.5, { input: 1200, output: 300, reasoning: 400, cache: { read: 400000, write: 20000 } }, 0));
 await hooks.event(messageEvent("m2", 0.2, { input: 800, output: 150, reasoning: 100, cache: { read: 100000, write: 0 } }, 600000));
 await hooks.event({ event: { type: "session.idle", properties: { sessionID: "s" } } });
@@ -50,14 +51,14 @@ console.log("title=" + toasts[0].title + " duration=" + toasts[0].duration + " l
 // rollup, table: only the root reports, summing spawned subagents, labelled by agent + title
 const toasts2 = [];
 const c2 = { app: { log: async () => {} }, tui: { showToast: async ({ body }) => toasts2.push(body) } };
-const r = createTracker({ title: "run" }, c2);
-r.ingestSession({ id: "P", parentID: null, title: "Fix slope edges" });
-r.ingestSession({ id: "A", parentID: "P", title: "explore slope joins" });
-r.ingestSession({ id: "B", parentID: "P", title: "commit slope fix" });
+const r = createTracker({ title: "run" }, { ...c2, session: { messages: async () => ({ data: [] }) } }, () => Date.now(), process.cwd());
+await r.ingestSession({ id: "P", parentID: null, directory: process.cwd(), title: "Fix slope edges" });
+await r.ingestSession({ id: "A", parentID: "P", directory: process.cwd(), title: "explore slope joins" });
+await r.ingestSession({ id: "B", parentID: "P", directory: process.cwd(), title: "commit slope fix" });
 const mk = (sid, id, mode, cost, input, output) => ({ sessionID: sid, id, mode, role: "assistant", cost, tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } }, providerID: "p", modelID: "m", time: { created: 0 } });
-r.ingest(mk("P", "p1", "fusion-planner", 0.1, 100, 10));
-r.ingest(mk("A", "a1", "fusion-explorer", 0.2, 200, 20));
-r.ingest(mk("B", "b1", "fusion-ops", 0.3, 300, 30));
+await r.ingest(mk("P", "p1", "fusion-planner", 0.1, 100, 10));
+await r.ingest(mk("A", "a1", "fusion-explorer", 0.2, 200, 20));
+await r.ingest(mk("B", "b1", "fusion-ops", 0.3, 300, 30));
 assert.equal(await r.emit("A"), null); // subagent is silent
 assert.equal(await r.emit("B"), null);
 const rootLine = await r.emit("P");

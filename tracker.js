@@ -8,7 +8,7 @@
  */
 import { formatLine, formatTable, fmtDuration, normalizeOptions } from "./lib.js";
 import os from "node:os";
-import { aggregate, canonicalRoot, createStore, descendants, newLedger, recordMessage, recordSession, tombstoneSession, mergeLedger, deltaLedger, hasChanges, resolveActiveGuardConfig, projectKey, effectiveBudgetLimits, readStore } from "./accounting.js";
+import { aggregate, canonicalRoot, canonicalAncestry, createStore, descendants, newLedger, recordMessage, recordSession, tombstoneSession, mergeLedger, deltaLedger, hasChanges, resolveActiveGuardConfig, projectKey, effectiveBudgetLimits, readStore, appendSubagentCheckpoints } from "./accounting.js";
 
 export function createTracker(options, client, clock = () => Date.now(), projectDirectory = process.cwd()) {
   const cfg = normalizeOptions(options);
@@ -21,6 +21,7 @@ export function createTracker(options, client, clock = () => Date.now(), project
   /** @type {Map<string, {messages: Map<string,{cost:number,tokens:any,mode?:string}>, first?:number, last?:number, models:Set<string>, modes:Map<string,number>, printedKey:?string}>} */
   const sessions = new Map();
   const titles = new Map();
+  const projectIdentity = projectKey(projectDirectory);
 
   const get = (id) => {
     let s = sessions.get(id);
@@ -63,7 +64,44 @@ export function createTracker(options, client, clock = () => Date.now(), project
   const ingestSession = async (info) => {
     if (!info || !info.id) return;
     if (info.title) titles.set(info.id, info.title);
-    await enqueue((current) => recordSession(current, info, { writerID: `stats:${process.pid}`, writerSeq: ++writerSeq }));
+    const localProjectKey = await projectIdentity;
+    const metadataVerified = typeof info.directory === "string" &&
+      await projectKey(info.directory).then((key) => key === localProjectKey).catch(() => false);
+    await enqueue((current) => recordSession(current, info, { writerID: `stats:${process.pid}`, writerSeq: ++writerSeq,
+      metadataVerified, projectKey: metadataVerified ? localProjectKey : null }));
+  };
+  const sdkSessionIDs = new Set();
+  const verifySessionFromSdk = async (id, expectedProject = projectDirectory) => {
+    if (sdkSessionIDs.has(id) && ledger.sessions[id]?.metadataVerified === true && ledger.sessions[id]?.projectKey === await projectIdentity) return true;
+    sdkSessionIDs.delete(id);
+    if (typeof client?.session?.get !== "function") return false;
+    try {
+      const response = await client.session.get({ path: { id } });
+      const data = response?.data;
+      const directory = data?.directory;
+      if (!data || response.error || data.id !== id || typeof directory !== "string" || typeof data.projectID !== "string" ||
+        await projectKey(directory).catch(() => null) !== await projectKey(expectedProject)) return false;
+      await ingestSession(data);
+      const verified = ledger.sessions[id]?.metadataVerified === true && ledger.sessions[id]?.projectKey === await projectIdentity;
+      if (verified) sdkSessionIDs.add(id);
+      return verified;
+    } catch { return false; }
+  };
+  const recoverVerifiedAncestry = async (id) => {
+    const seen = new Set();
+    let current = id;
+    for (let depth = 0; depth < 128; depth++) {
+      if (seen.has(current)) return false;
+      seen.add(current);
+      if (!(await verifySessionFromSdk(current))) return false;
+      await reload();
+      const session = ledger.sessions[current];
+      if (!session || session.metadataVerified !== true || session.projectKey !== await projectIdentity || !Object.hasOwn(session, "parentID")) return false;
+      if (session.parentID == null) return true;
+      if (typeof session.parentID !== "string" || !session.parentID) return false;
+      current = session.parentID;
+    }
+    return false;
   };
 
   const ingest = async (info) => {
@@ -127,6 +165,7 @@ export function createTracker(options, client, clock = () => Date.now(), project
     await mutationQueue;
     await refreshGuardConfig();
     await reload();
+    if (!ledger.sessions[sessionID]?.metadataVerified) return null;
     const isSubagent = ledger.sessions[sessionID]?.parentID != null;
     if (cfg.rollup && isSubagent) return null;
 
@@ -156,7 +195,7 @@ export function createTracker(options, client, clock = () => Date.now(), project
         : formatLine({ ...total, costAvailable: rawTotal.costAvailable, includeReasoning: cfg.includeReasoning })}\n` +
       `Cost: ${rawTotal.costAvailable ? "available" : `incomplete; known subtotal $${rawTotal.costKnownLowerBound.toFixed(4)}`}; budget tokens: ${total.totalTokens}; ` +
       `message span: ${total.ms} ms; run elapsed: ${fmtDuration(total.elapsedMs)}; attribution: ${ancestry.complete ? "complete" : "incomplete"}`
-      + budgetSummary(ancestry.id, sessionID, rawTotal);
+      + await budgetSummary(ancestry.id, sessionID, rawTotal);
 
     if (cfg.showLog) {
       try {
@@ -187,16 +226,21 @@ export function createTracker(options, client, clock = () => Date.now(), project
     cfg.guardSummary = result.available ? { schema: "opencode-cost-guard-budget-v1", ...result.config, approvals: source.approvals || [] } : null;
   };
 
-  const budgetSummary = (runId, reportSession, totals) => {
-    const effective = effectiveBudget(runId, reportSession, totals);
+  const budgetSummary = async (runId, reportSession, totals) => {
+    const effective = await effectiveBudget(runId, reportSession, totals);
     if (!effective.available) return "\nGuard budget: unavailable";
     return `\nGuard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}; remaining ${effective.runUsdRemaining ?? "unavailable"}; overage ${effective.runUsdOverage ?? "unavailable"}; session USD remaining ${effective.sessionUsdRemaining ?? "unavailable"}; run token remaining ${effective.runTokensRemaining ?? "unavailable"}`;
   };
 
-  const effectiveBudget = (runId, sessionID, totals, sessionTotals = aggregate(ledger, [sessionID])) => {
+  const effectiveBudget = async (runId, sessionID, totals, sessionTotals = aggregate(ledger, [sessionID])) => {
     const guard = cfg.guardSummary;
-    if (!guard || guard.schema !== "opencode-cost-guard-budget-v1") return { available: false };
-    const effective = effectiveBudgetLimits(guard, { agent: agentOf(sessionID), sessionID, rootID: runId, approvals: guard.approvals || [] });
+    if (!guard || guard.schema !== "opencode-cost-guard-budget-v1") return { available: false, attributionComplete: false, attributionReason: "configuration-unavailable", subagentApplicable: false, subagentBaseLimit: null, subagentEffectiveLimit: null, subagentCapAvailable: false, activeTokenDimensions: { legacySession: null, subagent: null, effectiveSession: null }, legacyTokenLimit: null, effectiveSessionTokenLimit: null };
+    const ancestry = canonicalAncestry(ledger, sessionID, guard.projectKey || await projectIdentity);
+    if (!ancestry.complete) return { available: false, attributionComplete: false, attributionReason: ancestry.reason,
+      subagentApplicable: false, subagentBaseLimit: null, subagentEffectiveLimit: null, subagentCapAvailable: false,
+      activeTokenDimensions: { legacySession: null, subagent: null, effectiveSession: null }, legacyTokenLimit: null,
+      effectiveSessionTokenLimit: null };
+    const effective = effectiveBudgetLimits(guard, { agent: agentOf(sessionID), sessionID, rootID: runId, approvals: guard.approvals || [], ancestry });
     const runUsdLimit = effective.runUsdLimit;
     const sessionUsdLimit = effective.sessionUsdLimit;
     const runTokenLimit = effective.runTokenLimit;
@@ -205,6 +249,12 @@ export function createTracker(options, client, clock = () => Date.now(), project
       extensions: { sessionUsd: effective.sessionExtensionUsd, sessionTokens: effective.sessionExtensionTokens,
         runUsd: effective.runExtensionUsd, runTokens: effective.runExtensionTokens },
       costAvailable: totals.costAvailable, knownCostLowerBound: totals.costKnownLowerBound, runUsdLimit: effective.runUsdLimit,
+      attributionComplete: effective.ancestryComplete, attributionReason: effective.ancestryReason,
+      subagentApplicable: effective.subagentApplicable, subagentBaseLimit: effective.subagentBaseLimit,
+      subagentEffectiveLimit: effective.subagentEffectiveLimit, subagentCapAvailable: effective.subagentBaseLimit != null,
+      activeTokenDimensions: { legacySession: effective.legacyTokenLimit, subagent: effective.subagentBaseLimit,
+        effectiveSession: effective.effectiveSessionTokenLimit }, legacyTokenLimit: effective.legacyTokenLimit,
+      effectiveSessionTokenLimit: effective.effectiveSessionTokenLimit,
       sessionUsdLimit, sessionUsdRemaining: sessionUsdLimit == null ? null : Math.max(0, sessionUsdLimit - sessionTotals.costKnownLowerBound),
       sessionUsdOverage: sessionUsdLimit == null ? null : Math.max(0, sessionTotals.costKnownLowerBound - sessionUsdLimit),
       runUsdLimit, runUsdRemaining: runUsdLimit == null ? null : Math.max(0, runUsdLimit - totals.costKnownLowerBound),
@@ -238,6 +288,31 @@ export function createTracker(options, client, clock = () => Date.now(), project
     await enqueue((current) => mergeLedger(current, recovered));
     historyCoverage.set(sessionID, complete ? "recovered" : "incomplete");
   };
+  const checkpointEntries = async (callerSessionID) => {
+    await reload(); await refreshGuardConfig();
+    await recoverVerifiedAncestry(callerSessionID);
+    const caller = canonicalAncestry(ledger, callerSessionID, await projectIdentity);
+    if (!caller.complete || !caller.isRoot || caller.id !== callerSessionID) return [];
+    const candidates = descendants(ledger, callerSessionID).filter((id) => id !== callerSessionID);
+    const notices = [];
+    for (const childID of candidates) {
+      await recoverVerifiedAncestry(childID);
+      const ancestry = canonicalAncestry(ledger, childID, await projectIdentity);
+      if (!ancestry.complete || ancestry.id !== callerSessionID) continue;
+      const totals = aggregate(ledger, [childID]);
+      const guard = cfg.guardSummary;
+      if (!guard) continue;
+      const effective = effectiveBudgetLimits(guard, { agent: agentOf(childID), sessionID: childID, rootID: callerSessionID,
+        approvals: guard.approvals || [], ancestry });
+      if (effective.subagentEffectiveLimit == null || totals.totalTokens < effective.subagentEffectiveLimit) continue;
+      notices.push({ id: childID, title: titles.get(childID), totalTokens: totals.totalTokens,
+        input: totals.input, output: totals.output, reasoning: totals.reasoning, limit: effective.subagentEffectiveLimit,
+        approvalTokens: effective.subagentBaseLimit });
+    }
+    return notices;
+  };
+  const checkpointNotice = async (callerSessionID, maxDescendants = 8) =>
+    appendSubagentCheckpoints("", await checkpointEntries(callerSessionID), { limit: maxDescendants });
 
   const report = async (sessionID, scope = "run", selectedSession) => {
     await reload(); await refreshGuardConfig();
@@ -245,14 +320,23 @@ export function createTracker(options, client, clock = () => Date.now(), project
     await recover(reportSession);
     await mutationQueue;
     await reload();
-    const root = canonicalRoot(ledger, reportSession);
+    const root = canonicalAncestry(ledger, reportSession, await projectIdentity);
     const sessionIDs = [reportSession], runIDs = descendants(ledger, root.id);
     const ids = scope === "session" ? sessionIDs : runIDs;
     const raw = aggregate(ledger, ids), runTotals = aggregate(ledger, runIDs), sessionTotals = aggregate(ledger, sessionIDs);
     const runStart = runIDs.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
-    const runBudget = effectiveBudget(root.id, reportSession, runTotals, sessionTotals);
+    const runBudget = await effectiveBudget(root.id, reportSession, runTotals, sessionTotals);
     const sessionBudget = {
       available: runBudget.available,
+      attributionComplete: runBudget.attributionComplete,
+      attributionReason: runBudget.attributionReason,
+      subagentApplicable: runBudget.subagentApplicable,
+      subagentBaseLimit: runBudget.subagentBaseLimit,
+      subagentEffectiveLimit: runBudget.subagentEffectiveLimit,
+      subagentCapAvailable: runBudget.subagentCapAvailable,
+      activeTokenDimensions: runBudget.activeTokenDimensions,
+      legacyTokenLimit: runBudget.legacyTokenLimit,
+      effectiveSessionTokenLimit: runBudget.effectiveSessionTokenLimit,
       appliesToSession: runBudget.appliesToSession,
       excludedFromSessionBudget: runBudget.excludedFromSessionBudget,
       extensions: runBudget.extensions,
@@ -266,6 +350,8 @@ export function createTracker(options, client, clock = () => Date.now(), project
       sessionBudgetAvailable: runBudget.sessionBudgetAvailable,
     };
     return { scope, sessionID: reportSession, runID: root.id, attributionComplete: root.complete,
+      subagentAttributionComplete: runBudget.attributionComplete ?? false,
+      subagentAttributionReason: runBudget.attributionReason ?? "unknown",
       cost: raw.cost, costAvailable: raw.costAvailable, ...raw, messageSpanMs: raw.first != null && raw.last != null ? raw.last - raw.first : 0,
       runElapsedMs: Number.isFinite(runStart) ? Math.max(0, clock() - runStart) : 0,
        historyCoverage: historyCoverage.get(sessionID) || "unavailable",
@@ -276,5 +362,5 @@ export function createTracker(options, client, clock = () => Date.now(), project
     await reload();
   };
 
-  return { ingest, ingestSession, emit, forget, report, refresh, refreshGuardConfig, ready, _ledger: () => ledger, _sessions: sessions, _cfg: cfg };
+  return { ingest, ingestSession, recoverVerifiedAncestry, emit, forget, report, refresh, refreshGuardConfig, checkpointNotice, checkpointEntries, ready, _ledger: () => ledger, _sessions: sessions, _cfg: cfg };
 }
