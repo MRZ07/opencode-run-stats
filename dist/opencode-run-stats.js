@@ -19,43 +19,6 @@ function fmtUsd(n) {
   const v = Number(n) || 0;
   return "$" + (Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(4));
 }
-function summarize(s) {
-  let cost = 0;
-  const t = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
-  let turns = 0;
-  for (const m of s.messages.values()) {
-    turns++;
-    cost += m.cost || 0;
-    const tk = m.tokens;
-    if (tk) {
-      t.input += tk.input || 0;
-      t.output += tk.output || 0;
-      t.reasoning += tk.reasoning || 0;
-      t.cacheRead += tk.cache?.read || 0;
-      t.cacheWrite += tk.cache?.write || 0;
-    }
-  }
-  const ms = s.first != null && s.last != null ? Math.max(0, s.last - s.first) : 0;
-  return { cost, ...t, ms, turns, model: [...s.models || []].join(", ") || null };
-}
-function summarizeMany(list) {
-  const acc = { messages: new Map, first: undefined, last: undefined, models: new Set };
-  let i = 0;
-  for (const s of list) {
-    if (!s)
-      continue;
-    for (const [k, v] of s.messages)
-      acc.messages.set(`${i}:${k}`, v);
-    if (s.first != null)
-      acc.first = acc.first == null ? s.first : Math.min(acc.first, s.first);
-    if (s.last != null)
-      acc.last = acc.last == null ? s.last : Math.max(acc.last, s.last);
-    for (const m of s.models || [])
-      acc.models.add(m);
-    i++;
-  }
-  return summarize(acc);
-}
 function formatLine(s) {
   const parts = [
     `in ${fmtTokens(s.input)}`,
@@ -64,7 +27,7 @@ function formatLine(s) {
   ];
   if (s.includeReasoning)
     parts.push(`reason ${fmtTokens(s.reasoning)}`);
-  parts.push(fmtUsd(s.cost));
+  parts.push(s.costAvailable === false ? "cost unavailable" : fmtUsd(s.cost));
   parts.push(fmtDuration(s.ms));
   return parts.join(" · ");
 }
@@ -78,7 +41,12 @@ function normalizeOptions(options = {}) {
     minCost: typeof options.minCost === "number" && options.minCost >= 0 ? options.minCost : 0,
     rollup: options.rollup !== false,
     format: options.format === "line" ? "line" : "table",
-    maxTitle: typeof options.maxTitle === "number" && options.maxTitle > 0 ? options.maxTitle : 24
+    maxTitle: typeof options.maxTitle === "number" && options.maxTitle > 0 ? options.maxTitle : 24,
+    scope: options.scope === "session" ? "session" : "run",
+    persist: options.persist !== false,
+    stateDirectory: typeof options.stateDirectory === "string" ? options.stateDirectory : null,
+    guardSummary: options.guardSummary && typeof options.guardSummary === "object" ? options.guardSummary : null,
+    now: typeof options.now === "function" ? options.now : null
   };
 }
 var pad = (s, w, right) => right ? String(s).padStart(w) : String(s).padEnd(w);
@@ -97,7 +65,7 @@ function formatTable(rows, opts = {}) {
   ];
   if (opts.includeReasoning)
     cols.push({ key: "reason", head: "reason", right: true, val: (r) => fmtTokens(r.reasoning) });
-  cols.push({ key: "cost", head: "cost", right: true, val: (r) => fmtUsd(r.cost) });
+  cols.push({ key: "cost", head: "cost", right: true, val: (r) => r.costAvailable === false ? "unavailable" : fmtUsd(r.cost) });
   cols.push({ key: "time", head: "time", right: true, val: (r) => fmtDuration(r.ms) });
   const all = opts.total ? [...rows, { agent: "TOTAL", title: "", depth: 0, ...opts.total }] : rows;
   const widths = cols.map((c) => Math.max(c.head.length, ...all.map((r) => String(c.val(r)).length)));
@@ -112,10 +80,550 @@ function formatTable(rows, opts = {}) {
 }
 
 // tracker.js
-function createTracker(options, client) {
+import os2 from "node:os";
+
+// accounting.js
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { createHash, randomUUID } from "node:crypto";
+var STATE_VERSION = 1;
+var JOURNAL_VERSION = 1;
+var MAX_STATE_BYTES = 8 * 1024 * 1024;
+var MAX_JOURNAL_RECORDS = 1e5;
+var MAX_JOURNAL_BYTES = 64 * 1024 * 1024;
+var CONFIG_LEASE_MS = 5 * 60000;
+var finite = (n) => typeof n === "number" && Number.isFinite(n) && n >= 0;
+function normalizeUsage(info = {}) {
+  const t = info.tokens || {};
+  const fields = [t.input, t.output, t.reasoning, t.cache?.read, t.cache?.write];
+  const tokens = {
+    input: finite(fields[0]) ? fields[0] : 0,
+    output: finite(fields[1]) ? fields[1] : 0,
+    reasoning: finite(fields[2]) ? fields[2] : 0,
+    cacheRead: finite(fields[3]) ? fields[3] : 0,
+    cacheWrite: finite(fields[4]) ? fields[4] : 0
+  };
+  return {
+    cost: finite(info.cost) ? info.cost : 0,
+    costKnown: finite(info.cost),
+    tokens,
+    tokensComplete: fields.every(finite),
+    budgetTokens: tokens.input + tokens.output + tokens.reasoning
+  };
+}
+function newLedger() {
+  return { version: STATE_VERSION, messages: {}, sessions: {}, approvals: [], configs: [] };
+}
+function messageKey(sessionID, id) {
+  return `${encodeURIComponent(sessionID)}:${encodeURIComponent(id)}`;
+}
+var versionValue = (record) => record.updatedAt ?? record.revision ?? null;
+var sourceRank = (record) => record.recovered ? 0 : 1;
+var receiptOrder = (a, b) => (a.receivedAt ?? a.timestamp ?? 0) - (b.receivedAt ?? b.timestamp ?? 0) || String(a.writerID || "").localeCompare(String(b.writerID || "")) || (a.writerSeq ?? 0) - (b.writerSeq ?? 0) || String(a.eventID || "").localeCompare(String(b.eventID || ""));
+var candidatesOf = (record) => record ? record.candidates || [record] : [];
+var uniqueCandidates = (records) => {
+  const byID = new Map;
+  for (const record of records.flatMap(candidatesOf)) {
+    const id = record.eventID || JSON.stringify(record);
+    const prior = byID.get(id);
+    if (!prior || JSON.stringify(record) < JSON.stringify(prior))
+      byID.set(id, record);
+  }
+  return [...byID.values()];
+};
+var winner = (records) => {
+  const candidates = uniqueCandidates(records);
+  const live = candidates.filter((record) => sourceRank(record) === 1);
+  const eligible = live.length ? live : candidates;
+  const kinds = new Set(eligible.map((record) => record.versionKind));
+  const comparable = eligible.every((record) => versionValue(record) != null) && kinds.size === 1 && !kinds.has(null);
+  const selected = [...eligible].sort((a, b) => {
+    if (comparable && versionValue(a) !== versionValue(b))
+      return versionValue(a) < versionValue(b) ? -1 : 1;
+    return receiptOrder(a, b);
+  }).at(-1);
+  return { ...selected, candidates };
+};
+function recordMessage(ledger, info, { recovered = false, receivedAt = Date.now(), writerID = "local", writerSeq, eventID = randomUUID() } = {}) {
+  if (!info || typeof info.sessionID !== "string" || !info.sessionID || typeof info.id !== "string" || !info.id)
+    return false;
+  writerSeq ??= Math.max(0, ...Object.values(ledger.messages).flatMap(candidatesOf).filter((record) => record.writerID === writerID).map((record) => record.writerSeq || 0)) + 1;
+  const record = {
+    sessionID: info.sessionID,
+    id: info.id,
+    usage: normalizeUsage(info),
+    mode: typeof info.mode === "string" ? info.mode : null,
+    model: info.providerID && info.modelID ? `${info.providerID}/${info.modelID}` : null,
+    createdAt: Number.isFinite(info.time?.created) ? info.time.created : null,
+    updatedAt: Number.isFinite(info.time?.updated) ? info.time.updated : null,
+    revision: Number.isFinite(info.revision) ? info.revision : null,
+    versionKind: Number.isFinite(info.time?.updated) ? "updated" : Number.isFinite(info.revision) ? "revision" : null,
+    receivedAt,
+    writerID,
+    writerSeq,
+    eventID,
+    recovered
+  };
+  return mergeRecord(ledger, record);
+}
+function mergeRecord(target, incoming) {
+  const key = messageKey(incoming.sessionID, incoming.id);
+  const prior = target.messages[key];
+  target.messages[key] = winner([...prior ? [prior] : [], incoming]);
+  return target.messages[key].eventID === incoming.eventID;
+}
+function recordSession(ledger, info, event = {}) {
+  if (!info || typeof info.id !== "string" || !info.id)
+    return;
+  const prior = ledger.sessions[info.id] || { parentID: null, startAt: null, metadata: {} };
+  const timestamp = Number.isFinite(info.time?.updated) ? info.time.updated : Number.isFinite(info.time?.created) ? info.time.created : event.receivedAt ?? Date.now();
+  const fields = {};
+  if (Object.hasOwn(info, "parentID"))
+    fields.parentID = info.parentID;
+  if (Number.isFinite(info.time?.created))
+    fields.startAt = info.time.created;
+  for (const field of ["projectID", "directory"])
+    if (Object.hasOwn(info, field) && typeof info[field] === "string")
+      fields[field] = info[field];
+  const candidates = uniqueCandidates([
+    ...prior.candidates || [],
+    {
+      fields,
+      timestamp,
+      receivedAt: event.receivedAt ?? Date.now(),
+      publishedAt: event.publishedAt ?? Date.now(),
+      updatedAt: Number.isFinite(info.time?.updated) ? info.time.updated : null,
+      revision: Number.isFinite(info.revision) ? info.revision : null,
+      versionKind: Number.isFinite(info.time?.updated) ? "updated" : Number.isFinite(info.revision) ? "revision" : null,
+      writerID: event.writerID || "local",
+      writerSeq: event.writerSeq || 0,
+      eventID: event.eventID || randomUUID()
+    }
+  ]);
+  ledger.sessions[info.id] = { ...prior, metadata: { ...prior.metadata }, candidates };
+  for (const field of new Set(candidates.flatMap((candidate) => Object.keys(candidate.fields || {})))) {
+    const selected = winner(candidates.filter((candidate) => Object.hasOwn(candidate.fields || {}, field)));
+    if (selected)
+      ledger.sessions[info.id][field] = selected.fields[field];
+  }
+  ledger.sessions[info.id].candidates = candidates;
+}
+function tombstoneSession(ledger, id, event = {}) {
+  if (typeof id !== "string" || !id)
+    return;
+  (ledger.tombstones ||= []).push({ id, timestamp: event.timestamp ?? Date.now(), writerID: event.writerID || "local", eventID: event.eventID || randomUUID() });
+}
+function hasChanges(delta) {
+  return Object.keys(delta.messages || {}).length > 0 || Object.keys(delta.sessions || {}).length > 0 || (delta.approvals || []).length > 0 || (delta.configs || []).length > 0 || (delta.tombstones || []).length > 0 || delta.budget != null;
+}
+function normalizeLedger(input) {
+  const ledger = newLedger();
+  if (!input)
+    return ledger;
+  if (input.version !== STATE_VERSION)
+    throw new Error("accounting state has an unsupported schema");
+  const groups = new Map;
+  for (const record of Object.values(input.messages || {})) {
+    const key = messageKey(record.sessionID, record.id);
+    const list = groups.get(key) || [];
+    list.push(...candidatesOf(record));
+    groups.set(key, list);
+  }
+  for (const [key, records] of groups)
+    ledger.messages[key] = winner(records);
+  for (const [id, old] of Object.entries(input.sessions || {})) {
+    const candidates = old.candidates || [{ fields: { parentID: old.parentID, startAt: old.startAt }, timestamp: old.timestamp ?? 0, writerID: old.writerID || "legacy", eventID: old.eventID || `legacy:${id}` }];
+    const fields = {};
+    const fieldNames = [...new Set(candidates.flatMap((candidate) => Object.keys(candidate.fields || {})))];
+    for (const name of fieldNames) {
+      const selected = winner(candidates.filter((candidate) => Object.hasOwn(candidate.fields || {}, name)));
+      if (selected)
+        fields[name] = selected.fields[name];
+    }
+    const unique = uniqueCandidates(candidates), resolved = {};
+    for (const field of new Set(unique.flatMap((candidate) => Object.keys(candidate.fields || {})))) {
+      const selected = winner(unique.filter((candidate) => Object.hasOwn(candidate.fields || {}, field)));
+      if (selected)
+        resolved[field] = selected.fields[field];
+    }
+    ledger.sessions[id] = { parentID: null, startAt: null, metadata: {}, ...resolved, candidates: unique.sort(receiptOrder) };
+  }
+  ledger.approvals = [...input.approvals || []];
+  ledger.configs = [...input.configs || []];
+  ledger.tombstones = [...input.tombstones || []];
+  ledger.budget = input.budget || null;
+  return ledger;
+}
+function mergeLedger(...sources) {
+  const ledger = newLedger(), msgs = new Map, sessions = {}, approvals = new Map, configs = new Map, tombstones = new Map;
+  for (const source of sources) {
+    if (!source)
+      continue;
+    for (const record of Object.values(source.messages || {})) {
+      const key = messageKey(record.sessionID, record.id);
+      (msgs.get(key) || msgs.set(key, []).get(key)).push(record);
+    }
+    for (const [id, data] of Object.entries(source.sessions || {})) {
+      sessions[id] ||= { candidates: [] };
+      sessions[id].candidates.push(...data.candidates || [{ fields: { parentID: data.parentID, startAt: data.startAt }, timestamp: 0, writerID: "legacy", eventID: `legacy:${id}` }]);
+    }
+    for (const item of source.approvals || [])
+      approvals.set(item.eventID || item.id, item);
+    for (const item of source.configs || [])
+      configs.set(item.eventID, item);
+    for (const item of source.tombstones || [])
+      tombstones.set(item.eventID, item);
+  }
+  for (const [key, records] of msgs)
+    ledger.messages[key] = winner(records);
+  for (const [id, data] of Object.entries(sessions)) {
+    const fields = {};
+    const names = [...new Set(data.candidates.flatMap((candidate) => Object.keys(candidate.fields || {})))];
+    for (const name of names) {
+      const selected = winner(data.candidates.filter((candidate) => Object.hasOwn(candidate.fields || {}, name)));
+      if (selected)
+        fields[name] = selected.fields[name];
+    }
+    const candidates = uniqueCandidates(data.candidates), resolved = {};
+    for (const field of new Set(candidates.flatMap((candidate) => Object.keys(candidate.fields || {})))) {
+      const selected = winner(candidates.filter((candidate) => Object.hasOwn(candidate.fields || {}, field)));
+      if (selected)
+        resolved[field] = selected.fields[field];
+    }
+    ledger.sessions[id] = { parentID: null, startAt: null, metadata: {}, ...resolved, candidates: candidates.sort(receiptOrder) };
+  }
+  ledger.approvals = [...approvals.values()].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  ledger.configs = [...configs.values()].sort((a, b) => a.eventID.localeCompare(b.eventID));
+  ledger.tombstones = [...tombstones.values()].sort((a, b) => a.eventID.localeCompare(b.eventID));
+  for (const record of Object.values(ledger.messages))
+    if (Number.isFinite(record.createdAt)) {
+      const session = ledger.sessions[record.sessionID] ||= { parentID: null, startAt: null, metadata: {}, candidates: [] };
+      session.startAt = session.startAt == null ? record.createdAt : Math.min(session.startAt, record.createdAt);
+    }
+  return ledger;
+}
+function deltaLedger(before, after) {
+  const delta = newLedger();
+  for (const [key, value] of Object.entries(after.messages || {})) {
+    const seen = new Set(candidatesOf(before.messages?.[key]).map((candidate) => candidate.eventID));
+    const additions = candidatesOf(value).filter((candidate) => !seen.has(candidate.eventID));
+    if (additions.length)
+      delta.messages[key] = { ...winner(additions), candidates: additions };
+  }
+  for (const [id, session] of Object.entries(after.sessions || {})) {
+    const previous = before.sessions?.[id];
+    const priorEvents = new Set((previous?.candidates || []).map((candidate) => candidate.eventID));
+    const additions = (session.candidates || []).filter((candidate) => !priorEvents.has(candidate.eventID));
+    if (additions.length)
+      delta.sessions[id] = { parentID: null, startAt: null, metadata: {}, candidates: additions };
+    else if (!previous && !session.candidates?.length)
+      delta.sessions[id] = session;
+  }
+  delta.approvals = (after.approvals || []).filter((item) => !(before.approvals || []).some((prior) => (prior.eventID || prior.id) === (item.eventID || item.id)));
+  delta.configs = (after.configs || []).filter((item) => !(before.configs || []).some((prior) => prior.eventID === item.eventID));
+  delta.tombstones = (after.tombstones || []).filter((item) => !(before.tombstones || []).some((prior) => prior.eventID === item.eventID));
+  if (JSON.stringify(before.budget) !== JSON.stringify(after.budget))
+    delta.budget = after.budget;
+  return delta;
+}
+function aggregate(ledger, sessionIDs) {
+  const ids = new Set(sessionIDs), out = {
+    cost: 0,
+    costKnownLowerBound: 0,
+    costAvailable: true,
+    tokensComplete: true,
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    turns: 0,
+    first: null,
+    last: null,
+    models: new Set
+  };
+  const normalized = normalizeLedger(ledger);
+  for (const record of Object.values(normalized.messages))
+    if (ids.has(record.sessionID)) {
+      out.turns++;
+      out.costAvailable &&= record.usage.costKnown;
+      if (record.usage.costKnown)
+        out.cost += record.usage.cost;
+      out.tokensComplete &&= record.usage.tokensComplete;
+      out.input += record.usage.tokens.input;
+      out.output += record.usage.tokens.output;
+      out.reasoning += record.usage.tokens.reasoning;
+      out.cacheRead += record.usage.tokens.cacheRead;
+      out.cacheWrite += record.usage.tokens.cacheWrite;
+      out.totalTokens += record.usage.budgetTokens;
+      if (record.createdAt != null) {
+        out.first = out.first == null ? record.createdAt : Math.min(out.first, record.createdAt);
+        out.last = out.last == null ? record.createdAt : Math.max(out.last, record.createdAt);
+      }
+      if (record.model)
+        out.models.add(record.model);
+    }
+  out.costKnownLowerBound = out.cost;
+  return out;
+}
+function descendants(ledger, root) {
+  const value = normalizeLedger(ledger), result = [], seen = new Set, stack = [root];
+  while (stack.length) {
+    const id = stack.pop();
+    if (seen.has(id))
+      continue;
+    seen.add(id);
+    result.push(id);
+    for (const [child, session] of Object.entries(value.sessions))
+      if (session.parentID === id && !seen.has(child))
+        stack.push(child);
+  }
+  return result;
+}
+function canonicalRoot(ledger, id) {
+  const value = normalizeLedger(ledger), seen = new Set;
+  let current = id;
+  while (value.sessions[current]?.parentID) {
+    if (seen.has(current))
+      return { id: current, complete: false };
+    seen.add(current);
+    current = value.sessions[current].parentID;
+  }
+  return { id: current, complete: !seen.has(current) };
+}
+function resolveActiveGuardConfig(ledger, { projectKey, hostname = os.hostname(), now = Date.now(), isAlive } = {}) {
+  const alive = isAlive || ((pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return error.code !== "ESRCH";
+    }
+  });
+  const active = (ledger.configs || []).filter((config) => config.projectKey === projectKey && config.hostname === hostname && now - (config.publishedAt ?? config.timestamp) <= CONFIG_LEASE_MS && now >= (config.publishedAt ?? config.timestamp) && alive(config.pid));
+  if (!active.length)
+    return { available: false, conflict: false };
+  const latestByInstance = new Map;
+  for (const config of active) {
+    const prior = latestByInstance.get(config.instanceID);
+    if (!prior || config.generation > prior.generation || config.generation === prior.generation && config.eventID > prior.eventID)
+      latestByInstance.set(config.instanceID, config);
+  }
+  const fingerprints = new Set([...latestByInstance.values()].map((record) => record.fingerprint));
+  if (fingerprints.size !== 1)
+    return { available: false, conflict: true };
+  return {
+    available: true,
+    conflict: false,
+    config: [...latestByInstance.values()].sort((a, b) => a.instanceID.localeCompare(b.instanceID))[0].config,
+    activeInstances: [...latestByInstance.values()]
+  };
+}
+function effectiveBudgetLimits(config, { agent, sessionID, rootID, approvals = [] }) {
+  const matches = (pattern) => agent == null ? pattern === "*" : globMatch(pattern, agent);
+  const resolve = (fallback, perAgent) => {
+    for (const [pattern, value] of perAgent || [])
+      if (matches(pattern))
+        return value;
+    return fallback;
+  };
+  const applies = !(config.exclude || []).some(matches) && (!(config.agents || []).length || (config.agents || []).some(matches));
+  const extra = (scope, id, key) => approvals.filter((item) => item.scope === scope && item.sessionID === id).flatMap((item) => item.dimensions || []).reduce((sum, dimension) => sum + (dimension[key] || 0), 0);
+  const usd = config.usdEnabled === false || !applies ? null : resolve(config.sessionLimit, config.limits);
+  const tokens = !applies || !Number.isFinite(config.tokenLimit) ? null : config.tokenLimit;
+  const sessionExtensionUsd = extra("session", sessionID, "usd"), sessionExtensionTokens = extra("session", sessionID, "tokens");
+  const runExtensionUsd = extra("run", rootID, "usd"), runExtensionTokens = extra("run", rootID, "tokens");
+  return {
+    applies,
+    excluded: (config.exclude || []).some(matches),
+    sessionExtensionUsd,
+    sessionExtensionTokens,
+    runExtensionUsd,
+    runExtensionTokens,
+    sessionUsdLimit: usd == null ? null : usd + sessionExtensionUsd,
+    sessionTokenLimit: tokens == null ? null : tokens + sessionExtensionTokens,
+    runUsdLimit: config.usdEnabled === false || !Number.isFinite(config.runLimit) ? null : config.runLimit + runExtensionUsd,
+    runTokenLimit: !Number.isFinite(config.runTokenLimit) ? null : config.runTokenLimit + runExtensionTokens
+  };
+}
+function globMatch(pattern, value) {
+  if (typeof pattern !== "string" || typeof value !== "string")
+    return false;
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`).test(value);
+}
+async function projectKey(projectDirectory = process.cwd()) {
+  try {
+    return createHash("sha256").update(await fs.realpath(projectDirectory)).digest("hex").slice(0, 24);
+  } catch (error) {
+    throw new Error(`cannot resolve OpenCode project directory ${projectDirectory}: ${error.message}`, { cause: error });
+  }
+}
+async function defaultStateDirectory(projectDirectory = process.cwd()) {
+  return path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "opencode-accounting", await projectKey(projectDirectory));
+}
+async function ensureDirectory(directory) {
+  await fs.mkdir(directory, { recursive: true, mode: 448 });
+  await fs.chmod(directory, 448);
+}
+function serializeRecord(record) {
+  const text = JSON.stringify(record);
+  if (Buffer.byteLength(text) > MAX_STATE_BYTES)
+    throw new Error("accounting journal event exceeds 8 MiB");
+  return text;
+}
+async function createStore({ directory, filename, projectDirectory = process.cwd(), persist = true, publication = {} }) {
+  const project = await projectKey(projectDirectory), base = directory || await defaultStateDirectory(projectDirectory);
+  const journalDir = path.join(base, `${project}-${filename}.journal`);
+  const legacyFile = path.join(base, `${project}-${filename}`);
+  if (persist)
+    await ensureDirectory(journalDir);
+  const read = async () => {
+    if (!persist)
+      return newLedger();
+    const names = await fs.readdir(journalDir).catch((error) => {
+      if (error.code === "ENOENT")
+        return [];
+      throw error;
+    });
+    const events = names.filter((name) => name.endsWith(".event")).sort();
+    if (events.length > MAX_JOURNAL_RECORDS)
+      throw new Error(`accounting journal exceeds ${MAX_JOURNAL_RECORDS} events; usage is incomplete`);
+    let bytes = 0;
+    const ledgers = [];
+    try {
+      const legacyStat = await fs.stat(legacyFile);
+      if (legacyStat.size > MAX_STATE_BYTES)
+        throw new Error("legacy accounting snapshot exceeds 8 MiB");
+      ledgers.push(normalizeLedger(JSON.parse(await fs.readFile(legacyFile, "utf8"))));
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw new Error(`cannot import legacy snapshot ${legacyFile}: ${error.message}`, { cause: error });
+    }
+    for (const name of events) {
+      const file = path.join(journalDir, name), stat = await fs.stat(file);
+      bytes += stat.size;
+      if (bytes > MAX_JOURNAL_BYTES)
+        throw new Error(`accounting journal exceeds ${MAX_JOURNAL_BYTES} bytes; usage is incomplete`);
+      let event;
+      try {
+        event = JSON.parse(await fs.readFile(file, "utf8"));
+      } catch (error) {
+        throw new Error(`invalid journal event ${name}: ${error.message}`, { cause: error });
+      }
+      if (event.version !== JOURNAL_VERSION || !event.payload || typeof event.eventID !== "string")
+        throw new Error(`invalid journal event schema: ${name}`);
+      ledgers.push(event.payload);
+    }
+    return mergeLedger(...ledgers);
+  };
+  return {
+    file: journalDir,
+    load: read,
+    replaceFromDisk: read,
+    async append(event) {
+      if (!persist)
+        return;
+      const eventID = event.eventID || randomUUID(), name = `${eventID}-${randomUUID()}.event`, final = path.join(journalDir, name);
+      const temporary = path.join(journalDir, `.${eventID}.${process.pid}.${randomUUID()}.tmp`), content = serializeRecord({ version: JOURNAL_VERSION, eventID, payload: event.payload });
+      try {
+        await fs.writeFile(temporary, content, { mode: 384, flag: "wx" });
+        await publication.beforeRename?.({ temporary, final });
+        await fs.rename(temporary, final);
+        await publication.afterRename?.({ final });
+      } catch (error) {
+        await fs.unlink(temporary).catch(() => {});
+        if (error.code !== "EEXIST")
+          throw error;
+      }
+    },
+    async update(mutation) {
+      if (!persist)
+        return newLedger();
+      if (typeof mutation !== "function") {
+        await this.append(mutation);
+        return read();
+      }
+      const before = await read();
+      const draft = mergeLedger(before);
+      await mutation(draft);
+      for (const session of Object.values(draft.sessions))
+        delete session.title;
+      const delta = deltaLedger(before, draft);
+      if (hasChanges(delta))
+        await this.append({ payload: delta });
+      return read();
+    },
+    async merge(local) {
+      if (!persist)
+        return local;
+      const before = await read();
+      const after = mergeLedger(before, normalizeLedger(local));
+      const delta = deltaLedger(before, after);
+      if (hasChanges(delta))
+        await this.append({ payload: delta });
+      return read();
+    }
+  };
+}
+async function readStore(options) {
+  if (options.persist === false)
+    return null;
+  const project = await projectKey(options.projectDirectory || process.cwd());
+  const base = options.directory || await defaultStateDirectory(options.projectDirectory || process.cwd());
+  const journalDir = path.join(base, `${project}-${options.filename}.journal`);
+  const legacyFile = path.join(base, `${project}-${options.filename}`);
+  const ledgers = [];
+  try {
+    const stat = await fs.stat(legacyFile);
+    if (stat.size > MAX_STATE_BYTES)
+      throw new Error("legacy accounting snapshot exceeds 8 MiB");
+    ledgers.push(normalizeLedger(JSON.parse(await fs.readFile(legacyFile, "utf8"))));
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      throw new Error(`cannot read legacy snapshot ${legacyFile}: ${error.message}`, { cause: error });
+  }
+  const names = await fs.readdir(journalDir).catch((error) => {
+    if (error.code === "ENOENT")
+      return [];
+    throw error;
+  });
+  const events = names.filter((name) => name.endsWith(".event")).sort();
+  if (events.length > MAX_JOURNAL_RECORDS)
+    throw new Error(`accounting journal exceeds ${MAX_JOURNAL_RECORDS} events; usage is incomplete`);
+  let bytes = 0;
+  for (const name of events) {
+    const file = path.join(journalDir, name), stat = await fs.stat(file);
+    bytes += stat.size;
+    if (bytes > MAX_JOURNAL_BYTES)
+      throw new Error(`accounting journal exceeds ${MAX_JOURNAL_BYTES} bytes; usage is incomplete`);
+    try {
+      const event = JSON.parse(await fs.readFile(file, "utf8"));
+      if (event.version !== JOURNAL_VERSION || !event.payload || typeof event.eventID !== "string")
+        throw new Error("unsupported event schema");
+      ledgers.push(event.payload);
+    } catch (error) {
+      throw new Error(`invalid journal event ${name}: ${error.message}`, { cause: error });
+    }
+  }
+  return mergeLedger(...ledgers);
+}
+
+// tracker.js
+function createTracker(options, client, clock = () => Date.now(), projectDirectory = process.cwd()) {
   const cfg = normalizeOptions(options);
+  let ledger = newLedger();
+  const storePromise = cfg.persist ? createStore({ directory: cfg.stateDirectory, filename: "run-stats.json", projectDirectory }) : Promise.resolve(null);
+  const ready = storePromise.then(async (store) => {
+    if (store)
+      ledger = await store.load();
+  });
+  let mutationQueue = Promise.resolve();
+  let writerSeq = 0;
+  const historyCoverage = new Map;
   const sessions = new Map;
-  const parents = new Map;
   const titles = new Map;
   const get = (id) => {
     let s = sessions.get(id);
@@ -125,20 +633,62 @@ function createTracker(options, client) {
     }
     return s;
   };
-  const ingestSession = (info) => {
+  const enqueue = (mutation) => {
+    mutationQueue = mutationQueue.then(async () => {
+      await ready;
+      const store = await storePromise;
+      if (store) {
+        const draft = structuredClone(ledger);
+        const returned = mutation(draft);
+        const changed = returned && returned.version ? returned : draft;
+        const delta = deltaLedger(ledger, changed);
+        if (hasChanges(delta))
+          await store.append({ payload: delta });
+        ledger = await store.load();
+      } else {
+        const returned = mutation(ledger);
+        if (returned && returned.version)
+          ledger = returned;
+      }
+    });
+    return mutationQueue;
+  };
+  const reload = async () => {
+    await ready;
+    mutationQueue = mutationQueue.then(async () => {
+      const store = await storePromise;
+      if (store)
+        ledger = await store.replaceFromDisk();
+    });
+    await mutationQueue;
+    hydrateRows();
+  };
+  const ingestSession = async (info) => {
     if (!info || !info.id)
       return;
-    parents.set(info.id, info.parentID ?? null);
     if (info.title)
       titles.set(info.id, info.title);
+    await enqueue((current) => recordSession(current, info, { writerID: `stats:${process.pid}`, writerSeq: ++writerSeq }));
   };
-  const ingest = (info) => {
+  const ingest = async (info) => {
     const s = get(info.sessionID);
+    const previous = s.messages.get(info.id);
+    await enqueue((current) => recordMessage(current, info, { writerID: `stats:${process.pid}`, writerSeq: ++writerSeq }));
+    const accepted = ledger.messages[`${encodeURIComponent(info.sessionID)}:${encodeURIComponent(info.id)}`];
+    if (!accepted || previous && previous.cost === accepted.usage.cost && previous.mode === accepted.mode && JSON.stringify(previous.tokens) === JSON.stringify(accepted.usage.tokens))
+      return;
     s.messages.set(info.id, {
-      cost: typeof info.cost === "number" ? info.cost : 0,
-      tokens: info.tokens || null,
-      mode: info.mode || null
+      cost: accepted.usage.cost,
+      tokens: {
+        input: accepted.usage.tokens.input,
+        output: accepted.usage.tokens.output,
+        reasoning: accepted.usage.tokens.reasoning,
+        cache: { read: accepted.usage.tokens.cacheRead, write: accepted.usage.tokens.cacheWrite }
+      },
+      mode: accepted.mode
     });
+    if (previous?.mode)
+      s.modes.set(previous.mode, Math.max(0, (s.modes.get(previous.mode) || 0) - 1));
     if (info.mode)
       s.modes.set(info.mode, (s.modes.get(info.mode) || 0) + 1);
     if (info.providerID && info.modelID)
@@ -149,65 +699,96 @@ function createTracker(options, client) {
       s.last = s.last == null ? created : Math.max(s.last, created);
     }
   };
-  const treeOf = (root) => {
-    const out = [root];
-    const stack = [root];
-    while (stack.length) {
-      const cur = stack.pop();
-      for (const [id, pid] of parents) {
-        if (pid === cur) {
-          out.push(id);
-          stack.push(id);
-        }
-      }
-    }
-    return out;
-  };
   const depthOf = (id) => {
-    let d = 0;
-    let cur = parents.get(id);
-    while (cur != null && d < 50) {
-      d++;
-      cur = parents.get(cur);
+    let depth = 0, current = ledger.sessions[id]?.parentID;
+    const seen = new Set([id]);
+    while (current != null && !seen.has(current) && depth < 50) {
+      seen.add(current);
+      depth++;
+      current = ledger.sessions[current]?.parentID;
     }
-    return d;
+    return depth;
   };
   const agentOf = (id) => {
-    const s = sessions.get(id);
-    if (!s || s.modes.size === 0)
-      return "?";
-    let best = "?";
-    let n = -1;
-    for (const [m, c] of s.modes)
-      if (c > n)
-        n = c, best = m;
+    const modes = new Map;
+    for (const record of Object.values(ledger.messages))
+      if (record.sessionID === id && record.mode)
+        modes.set(record.mode, (modes.get(record.mode) || 0) + 1);
+    let best = "?", count = -1;
+    for (const [mode, total] of modes)
+      if (total > count) {
+        best = mode;
+        count = total;
+      }
     return best;
   };
-  const rowFor = (id) => ({
-    agent: agentOf(id),
-    title: titles.get(id) || "",
-    depth: depthOf(id),
-    ...summarize(sessions.get(id))
-  });
+  const usageSummary = (id) => {
+    const value = aggregate(ledger, [id]);
+    return {
+      ...value,
+      cost: value.cost,
+      costAvailable: value.costAvailable,
+      turns: value.turns,
+      ms: value.first != null && value.last != null ? Math.max(0, value.last - value.first) : 0,
+      model: [...value.models].join(", ") || null
+    };
+  };
+  const hydrateRows = () => {
+    for (const [id, state] of sessions) {
+      state.messages.clear();
+      for (const record of Object.values(ledger.messages))
+        if (record.sessionID === id)
+          state.messages.set(record.id, {
+            cost: record.usage.cost,
+            tokens: {
+              input: record.usage.tokens.input,
+              output: record.usage.tokens.output,
+              reasoning: record.usage.tokens.reasoning,
+              cache: { read: record.usage.tokens.cacheRead, write: record.usage.tokens.cacheWrite }
+            },
+            mode: record.mode
+          });
+    }
+  };
+  const rowFor = (id) => ({ agent: agentOf(id), title: titles.get(id) || "", depth: depthOf(id), ...usageSummary(id) });
   const emit = async (sessionID) => {
-    const isSubagent = parents.get(sessionID) != null;
+    await reload();
+    await recover(sessionID);
+    await mutationQueue;
+    await refreshGuardConfig();
+    await reload();
+    const isSubagent = ledger.sessions[sessionID]?.parentID != null;
     if (cfg.rollup && isSubagent)
       return null;
-    const ids = cfg.rollup ? treeOf(sessionID) : [sessionID];
-    const present = ids.filter((id) => sessions.get(id) && sessions.get(id).messages.size);
-    const total = summarizeMany(present.map((id) => sessions.get(id)));
+    const ancestry = cfg.rollup ? canonicalRoot(ledger, sessionID) : { id: sessionID, complete: true };
+    const ids = cfg.rollup ? descendants(ledger, ancestry.id) : [sessionID];
+    hydrateRows();
+    const present = ids.filter((id) => aggregate(ledger, [id]).turns > 0);
+    const rawTotal = aggregate(ledger, present);
+    const rootStart = ids.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
+    const elapsedStart = ids.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
+    const total = {
+      ...rawTotal,
+      cost: rawTotal.cost,
+      ms: rawTotal.first != null && rawTotal.last != null ? Math.max(0, rawTotal.last - rawTotal.first) : 0,
+      model: [...rawTotal.models].join(", ") || null,
+      turns: rawTotal.turns,
+      elapsedMs: Number.isFinite(elapsedStart) ? Math.max(0, clock() - elapsedStart) : 0,
+      attributionComplete: ancestry.complete
+    };
     if (total.turns === 0)
       return null;
-    if (total.cost === 0 && total.input === 0 && total.output === 0)
+    if (rawTotal.costAvailable && total.cost === 0 && total.input === 0 && total.output === 0)
       return null;
-    if (total.cost < cfg.minCost)
+    if (rawTotal.costAvailable && rawTotal.cost < cfg.minCost && total.totalTokens === 0)
       return null;
-    const key = [total.turns, total.cost, total.input, total.output, total.cacheRead, total.cacheWrite, total.ms].join("|");
-    const root = get(sessionID);
-    if (root.printedKey === key)
+    const key = [total.turns, total.costAvailable, total.cost, total.input, total.output, total.cacheRead, total.cacheWrite, total.ms].join("|");
+    const printed = get(sessionID);
+    if (printed.printedKey === key)
       return null;
-    root.printedKey = key;
-    const text = cfg.format === "table" ? formatTable(present.map(rowFor), { includeReasoning: cfg.includeReasoning, maxTitle: cfg.maxTitle, total }) : formatLine({ ...total, includeReasoning: cfg.includeReasoning });
+    printed.printedKey = key;
+    const text = `${cfg.format === "table" ? formatTable(present.map(rowFor), { includeReasoning: cfg.includeReasoning, maxTitle: cfg.maxTitle, total: { ...total, costAvailable: rawTotal.costAvailable } }) : formatLine({ ...total, costAvailable: rawTotal.costAvailable, includeReasoning: cfg.includeReasoning })}
+` + `Cost: ${rawTotal.costAvailable ? "available" : `incomplete; known subtotal $${rawTotal.costKnownLowerBound.toFixed(4)}`}; budget tokens: ${total.totalTokens}; ` + `message span: ${total.ms} ms; run elapsed: ${fmtDuration(total.elapsedMs)}; attribution: ${ancestry.complete ? "complete" : "incomplete"}` + budgetSummary(ancestry.id, sessionID, rawTotal);
     if (cfg.showLog) {
       try {
         await client.app.log({ body: { service: "run-stats", level: "info", message: text, extra: total } });
@@ -222,19 +803,155 @@ function createTracker(options, client) {
     }
     return text;
   };
-  const forget = (id) => {
-    sessions.delete(id);
-    parents.delete(id);
-    titles.delete(id);
+  const forget = async (id) => enqueue((current) => tombstoneSession(current, id));
+  const refreshGuardConfig = async () => {
+    if (!cfg.persist) {
+      cfg.guardSummary = null;
+      return;
+    }
+    const source = await readStore({ directory: cfg.stateDirectory, filename: "cost-guard.json", projectDirectory });
+    if (!source) {
+      cfg.guardSummary = null;
+      return;
+    }
+    const result = resolveActiveGuardConfig(source, { projectKey: await projectKey(projectDirectory), hostname: os2.hostname() });
+    cfg.guardSummary = result.available ? { schema: "opencode-cost-guard-budget-v1", ...result.config, approvals: source.approvals || [] } : null;
   };
-  return { ingest, ingestSession, emit, forget, _sessions: sessions, _cfg: cfg };
+  const budgetSummary = (runId, reportSession, totals) => {
+    const effective = effectiveBudget(runId, reportSession, totals);
+    if (!effective.available)
+      return `
+Guard budget: unavailable`;
+    return `
+Guard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}; remaining ${effective.runUsdRemaining ?? "unavailable"}; overage ${effective.runUsdOverage ?? "unavailable"}; session USD remaining ${effective.sessionUsdRemaining ?? "unavailable"}; run token remaining ${effective.runTokensRemaining ?? "unavailable"}`;
+  };
+  const effectiveBudget = (runId, sessionID, totals, sessionTotals = aggregate(ledger, [sessionID])) => {
+    const guard = cfg.guardSummary;
+    if (!guard || guard.schema !== "opencode-cost-guard-budget-v1")
+      return { available: false };
+    const effective = effectiveBudgetLimits(guard, { agent: agentOf(sessionID), sessionID, rootID: runId, approvals: guard.approvals || [] });
+    const runUsdLimit = effective.runUsdLimit;
+    const sessionUsdLimit = effective.sessionUsdLimit;
+    const runTokenLimit = effective.runTokenLimit;
+    const sessionTokenLimit = effective.sessionTokenLimit;
+    return {
+      available: true,
+      appliesToSession: effective.applies,
+      excludedFromSessionBudget: effective.excluded,
+      extensions: {
+        sessionUsd: effective.sessionExtensionUsd,
+        sessionTokens: effective.sessionExtensionTokens,
+        runUsd: effective.runExtensionUsd,
+        runTokens: effective.runExtensionTokens
+      },
+      costAvailable: totals.costAvailable,
+      knownCostLowerBound: totals.costKnownLowerBound,
+      runUsdLimit: effective.runUsdLimit,
+      sessionUsdLimit,
+      sessionUsdRemaining: sessionUsdLimit == null ? null : Math.max(0, sessionUsdLimit - sessionTotals.costKnownLowerBound),
+      sessionUsdOverage: sessionUsdLimit == null ? null : Math.max(0, sessionTotals.costKnownLowerBound - sessionUsdLimit),
+      runUsdLimit,
+      runUsdRemaining: runUsdLimit == null ? null : Math.max(0, runUsdLimit - totals.costKnownLowerBound),
+      runUsdOverage: runUsdLimit == null ? null : Math.max(0, totals.costKnownLowerBound - runUsdLimit),
+      sessionTokenLimit,
+      sessionTokensRemaining: sessionTokenLimit == null ? null : Math.max(0, sessionTokenLimit - sessionTotals.totalTokens),
+      runTokenLimit,
+      runTokensRemaining: runTokenLimit == null ? null : Math.max(0, runTokenLimit - totals.totalTokens),
+      sessionBudgetAvailable: sessionUsdLimit != null || sessionTokenLimit != null,
+      runBudgetAvailable: runUsdLimit != null || runTokenLimit != null
+    };
+  };
+  const recover = async (sessionID) => {
+    if (historyCoverage.has(sessionID))
+      return;
+    if (typeof client?.session?.messages !== "function") {
+      historyCoverage.set(sessionID, "unavailable");
+      return;
+    }
+    const root = canonicalRoot(ledger, sessionID).id;
+    const ids = descendants(ledger, root);
+    if (!ids.length)
+      ids.push(sessionID);
+    const recovered = newLedger();
+    let complete = ids.length <= 128;
+    for (const id of ids.slice(0, 128)) {
+      try {
+        const response = await client.session.messages({ path: { id }, query: { limit: 500 } });
+        const entries = response?.data ?? response;
+        if (!Array.isArray(entries) || entries.length >= 500) {
+          complete = false;
+          continue;
+        }
+        for (const entry of entries) {
+          const info = entry?.info;
+          if (info?.role !== "assistant")
+            continue;
+          if (info.sessionID && !ids.includes(info.sessionID)) {
+            complete = false;
+            continue;
+          }
+          recordMessage(recovered, { ...info, sessionID: info.sessionID || id }, { recovered: true, writerID: `stats:${process.pid}` });
+        }
+      } catch {
+        complete = false;
+      }
+    }
+    await enqueue((current) => mergeLedger(current, recovered));
+    historyCoverage.set(sessionID, complete ? "recovered" : "incomplete");
+  };
+  const report = async (sessionID, scope = "run", selectedSession) => {
+    await reload();
+    await refreshGuardConfig();
+    const reportSession = selectedSession || sessionID;
+    await recover(reportSession);
+    await mutationQueue;
+    await reload();
+    const root = canonicalRoot(ledger, reportSession);
+    const sessionIDs = [reportSession], runIDs = descendants(ledger, root.id);
+    const ids = scope === "session" ? sessionIDs : runIDs;
+    const raw = aggregate(ledger, ids), runTotals = aggregate(ledger, runIDs), sessionTotals = aggregate(ledger, sessionIDs);
+    const runStart = runIDs.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
+    const runBudget = effectiveBudget(root.id, reportSession, runTotals, sessionTotals);
+    const sessionBudget = {
+      available: runBudget.available,
+      appliesToSession: runBudget.appliesToSession,
+      excludedFromSessionBudget: runBudget.excludedFromSessionBudget,
+      extensions: runBudget.extensions,
+      costAvailable: sessionTotals.costAvailable,
+      knownCostLowerBound: sessionTotals.costKnownLowerBound,
+      sessionUsdLimit: runBudget.sessionUsdLimit,
+      sessionUsdRemaining: runBudget.sessionUsdRemaining,
+      sessionUsdOverage: runBudget.sessionUsdOverage,
+      sessionTokenLimit: runBudget.sessionTokenLimit,
+      sessionTokensRemaining: runBudget.sessionTokensRemaining,
+      sessionBudgetAvailable: runBudget.sessionBudgetAvailable
+    };
+    return {
+      scope,
+      sessionID: reportSession,
+      runID: root.id,
+      attributionComplete: root.complete,
+      cost: raw.cost,
+      costAvailable: raw.costAvailable,
+      ...raw,
+      messageSpanMs: raw.first != null && raw.last != null ? raw.last - raw.first : 0,
+      runElapsedMs: Number.isFinite(runStart) ? Math.max(0, clock() - runStart) : 0,
+      historyCoverage: historyCoverage.get(sessionID) || "unavailable",
+      guardBudget: runBudget,
+      guardSessionBudget: sessionBudget
+    };
+  };
+  const refresh = async () => {
+    await reload();
+  };
+  return { ingest, ingestSession, emit, forget, report, refresh, refreshGuardConfig, ready, _ledger: () => ledger, _sessions: sessions, _cfg: cfg };
 }
 
 // deep-review.js
-import fs from "node:fs/promises";
+import fs2 from "node:fs/promises";
 import { constants } from "node:fs";
-import path from "node:path";
-import os from "node:os";
+import path2 from "node:path";
+import os3 from "node:os";
 var MESSAGE_LIMIT = 500;
 var HELPER_LIMIT = 32;
 var SESSION_ID = /\bses_[A-Za-z0-9]+\b/g;
@@ -444,21 +1161,21 @@ async function verifyChild(client, helperId, rootId) {
   return false;
 }
 async function safeReportPath(filePath, home) {
-  if (typeof filePath !== "string" || !path.isAbsolute(filePath))
+  if (typeof filePath !== "string" || !path2.isAbsolute(filePath))
     return null;
-  const base = path.join(home, "reports", "deep-review");
-  const normalized = path.resolve(filePath);
-  const relative = path.relative(base, normalized);
-  if (!relative || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative))
+  const base = path2.join(home, "reports", "deep-review");
+  const normalized = path2.resolve(filePath);
+  const relative = path2.relative(base, normalized);
+  if (!relative || relative.startsWith(`..${path2.sep}`) || relative === ".." || path2.isAbsolute(relative))
     return null;
-  if (!/\.md$/.test(normalized) || /(?:\.partial|\.tmp)(?:\.|$)/i.test(path.basename(normalized)))
+  if (!/\.md$/.test(normalized) || /(?:\.partial|\.tmp)(?:\.|$)/i.test(path2.basename(normalized)))
     return null;
   try {
-    const resolvedBase = await fs.realpath(base);
-    const resolvedFile = await fs.realpath(normalized);
+    const resolvedBase = await fs2.realpath(base);
+    const resolvedFile = await fs2.realpath(normalized);
     if (resolvedBase !== base || resolvedFile !== normalized)
       return null;
-    const stat = await fs.lstat(normalized);
+    const stat = await fs2.lstat(normalized);
     if (!stat.isFile() || stat.isSymbolicLink())
       return null;
   } catch {
@@ -470,15 +1187,15 @@ async function atomicReplace(filePath, content, mode) {
   const temporary = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   let handle;
   try {
-    handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), mode);
+    handle = await fs2.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), mode);
     await handle.writeFile(content, "utf8");
     await handle.sync();
     await handle.close();
     handle = null;
-    await fs.rename(temporary, filePath);
+    await fs2.rename(temporary, filePath);
   } finally {
     await handle?.close().catch(() => {});
-    await fs.unlink(temporary).catch(() => {});
+    await fs2.unlink(temporary).catch(() => {});
   }
 }
 function reportPathsFromTool(tool, args, output) {
@@ -506,9 +1223,9 @@ function reportPathsFromTool(tool, args, output) {
         paths.push(item.filePath);
     }
   }
-  return unique(paths.filter((value) => path.isAbsolute(value)));
+  return unique(paths.filter((value) => path2.isAbsolute(value)));
 }
-async function updateDeepReviewReport({ client, rootId, filePath, idleAt = Date.now(), home = os.homedir() }) {
+async function updateDeepReviewReport({ client, rootId, filePath, idleAt = Date.now(), home = os3.homedir() }) {
   const target = await safeReportPath(filePath, home);
   if (!target || !safeSessionId(rootId))
     return "ineligible";
@@ -517,7 +1234,7 @@ async function updateDeepReviewReport({ client, rootId, filePath, idleAt = Date.
     const root = await sessionInfo(client, rootId);
     if (!root || root.id !== rootId || root.parentID)
       return "ineligible";
-    handle = await fs.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    handle = await fs2.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
     const fileStat = await handle.stat();
     const original = await handle.readFile("utf8");
     const parsed = parseReport(original);
@@ -653,10 +1370,10 @@ ${costJson}
       return "pending";
     if (await safeReportPath(target, home) !== target)
       return "pending";
-    const currentStat = await fs.lstat(target);
+    const currentStat = await fs2.lstat(target);
     if (!currentStat.isFile() || currentStat.dev !== fileStat.dev || currentStat.ino !== fileStat.ino)
       return "pending";
-    if (await fs.readFile(target, "utf8") !== original)
+    if (await fs2.readFile(target, "utf8") !== original)
       return "pending";
     await handle.close();
     handle = null;
@@ -670,6 +1387,19 @@ ${costJson}
 }
 
 // index.js
+var z;
+try {
+  ({ z } = await import("zod"));
+} catch {
+  z = null;
+}
+var toolArgs = z ? {
+  scope: z.enum(["run", "session"]).optional(),
+  sessionID: z.string().min(1).max(256).optional()
+} : {};
+if (z)
+  for (const [key, schema] of Object.entries(toolArgs))
+    schema.describe(key === "scope" ? "Report scope; default run" : "A known session ID in this project");
 async function loadFileOptions() {
   try {
     const fs = await import("node:fs/promises");
@@ -681,21 +1411,62 @@ async function loadFileOptions() {
     return null;
   }
 }
-var RunStats = async ({ client }, options) => {
+var RunStats = async ({ client, directory }, options) => {
   const fileOptions = await loadFileOptions();
-  const tracker = createTracker({ ...fileOptions || {}, ...options || {} }, client);
+  const mergedOptions = { ...fileOptions || {}, ...options || {} };
+  const projectDirectory = directory?.worktree || directory?.project || directory || process.cwd();
+  const tracker = createTracker(mergedOptions, client, mergedOptions.now || (() => Date.now()), projectDirectory);
   const reportPaths = new Map;
+  const command = {
+    description: "Show current OpenCode run or session usage",
+    template: "Use the run_stats tool to report current usage. Default scope is run. If the user asks for session scope, pass scope=session."
+  };
   return {
+    config: async (input) => {
+      const configured = input.command || {};
+      if (!Object.hasOwn(configured, "run-stats"))
+        configured["run-stats"] = command;
+      input.command = configured;
+    },
+    tool: {
+      run_stats: {
+        description: "Report current run or session cost and token usage; pricing may be unavailable. Does not call a model.",
+        args: toolArgs,
+        async execute(args, context) {
+          const requested = args?.sessionID;
+          if (requested != null && (typeof requested !== "string" || requested.length === 0 || requested.length > 256))
+            throw new Error("run-stats: sessionID must be a non-empty string up to 256 characters");
+          if (requested) {
+            const currentResult = await client.session?.get?.({ path: { id: context.sessionID } });
+            const targetResult = await client.session?.get?.({ path: { id: requested } });
+            const validResponse = (response, id) => response && !response.error && response.data?.id === id && typeof (response.data.projectID || response.data.directory) === "string";
+            if (!validResponse(currentResult, context.sessionID) || !validResponse(targetResult, requested))
+              throw new Error("run-stats: selector requires successful session metadata with project identity");
+            const currentProject = currentResult.data.projectID || currentResult.data.directory;
+            const targetProject = targetResult.data.projectID || targetResult.data.directory;
+            if (currentProject !== targetProject)
+              throw new Error("run-stats: selected session belongs to another OpenCode project");
+          }
+          await tracker.ready;
+          await tracker.refresh();
+          await tracker.refreshGuardConfig();
+          const reportSession = requested || context.sessionID;
+          const result = await tracker.report(reportSession, args?.scope || "run");
+          return JSON.stringify(result, null, 2);
+        }
+      }
+    },
     event: async ({ event }) => {
       if (event.type === "message.updated") {
         const info = event.properties.info;
         if (info.role === "assistant")
-          tracker.ingest(info);
+          await tracker.ingest(info);
       } else if (event.type === "session.created" || event.type === "session.updated") {
-        tracker.ingestSession(event.properties.info);
+        await tracker.ingestSession(event.properties.info);
       } else if (event.type === "session.idle") {
         const sessionID = event.properties.sessionID;
         const idleAt = Date.now();
+        await tracker.refresh();
         await tracker.emit(sessionID);
         const paths = reportPaths.get(sessionID);
         reportPaths.delete(sessionID);
@@ -704,7 +1475,7 @@ var RunStats = async ({ client }, options) => {
         }
       } else if (event.type === "session.deleted") {
         const sessionID = event.properties.info.id;
-        tracker.forget(sessionID);
+        await tracker.forget(sessionID);
         reportPaths.delete(sessionID);
       }
     },

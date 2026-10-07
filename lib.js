@@ -36,9 +36,11 @@ export function summarize(s) {
   let cost = 0;
   const t = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
   let turns = 0;
+  let costAvailable = true;
   for (const m of s.messages.values()) {
     turns++;
     cost += m.cost || 0;
+    costAvailable &&= m.costAvailable !== false;
     const tk = m.tokens;
     if (tk) {
       t.input += tk.input || 0;
@@ -49,7 +51,9 @@ export function summarize(s) {
     }
   }
   const ms = s.first != null && s.last != null ? Math.max(0, s.last - s.first) : 0;
-  return { cost, ...t, ms, turns, model: [...(s.models || [])].join(", ") || null };
+  return { cost, costAvailable: s.costAvailable !== false && costAvailable, costKnownLowerBound: cost,
+    tokensComplete: [...s.messages.values()].every((message) => message.tokensComplete !== false), ...t, ms, turns, model: [...(s.models || [])].join(", ") || null,
+    totalTokens: t.input + t.output + t.reasoning, elapsedMs: 0, attributionComplete: true };
 }
 
 /**
@@ -82,7 +86,7 @@ export function formatLine(s) {
     `cache ${fmtTokens(s.cacheRead)} read / ${fmtTokens(s.cacheWrite)} write`,
   ];
   if (s.includeReasoning) parts.push(`reason ${fmtTokens(s.reasoning)}`);
-  parts.push(fmtUsd(s.cost));
+  parts.push(s.costAvailable === false ? "cost unavailable" : fmtUsd(s.cost));
   parts.push(fmtDuration(s.ms));
   return parts.join(" · ");
 }
@@ -118,6 +122,11 @@ export function normalizeOptions(options = {}) {
     rollup: options.rollup !== false,
     format: options.format === "line" ? "line" : "table",
     maxTitle: typeof options.maxTitle === "number" && options.maxTitle > 0 ? options.maxTitle : 24,
+    scope: options.scope === "session" ? "session" : "run",
+    persist: options.persist !== false,
+    stateDirectory: typeof options.stateDirectory === "string" ? options.stateDirectory : null,
+    guardSummary: options.guardSummary && typeof options.guardSummary === "object" ? options.guardSummary : null,
+    now: typeof options.now === "function" ? options.now : null,
   };
 }
 
@@ -142,7 +151,7 @@ export function formatTable(rows, opts = {}) {
     { key: "cache", head: "cache r/w", right: true, val: (r) => `${fmtTokens(r.cacheRead)}/${fmtTokens(r.cacheWrite)}` },
   ];
   if (opts.includeReasoning) cols.push({ key: "reason", head: "reason", right: true, val: (r) => fmtTokens(r.reasoning) });
-  cols.push({ key: "cost", head: "cost", right: true, val: (r) => fmtUsd(r.cost) });
+  cols.push({ key: "cost", head: "cost", right: true, val: (r) => r.costAvailable === false ? "unavailable" : fmtUsd(r.cost) });
   cols.push({ key: "time", head: "time", right: true, val: (r) => fmtDuration(r.ms) });
 
   const all = opts.total ? [...rows, { agent: "TOTAL", title: "", depth: 0, ...opts.total }] : rows;

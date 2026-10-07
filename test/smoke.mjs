@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { fmtTokens, fmtDuration, fmtUsd, summarize, formatLine, formatTable } from "../lib.js";
 import { createTracker } from "../tracker.js";
 
+const noPersist = (options = {}) => ({ ...options, persist: false });
+
 // formatting
 assert.equal(fmtTokens(500), "500");
 assert.equal(fmtTokens(1234), "1.2k");
@@ -27,7 +29,7 @@ assert.match(formatLine(sum), /cache 7k read \/ 100 write/);
 const toasts = [];
 const logs = [];
 const client = { app: { log: async ({ body }) => logs.push(body) }, tui: { showToast: async ({ body }) => toasts.push(body) } };
-const t = createTracker({ title: "stats", showLog: true, format: "line" }, client);
+const t = createTracker(noPersist({ title: "stats", showLog: true, format: "line" }), client);
 const msg = (id, cost, tokens, created) => ({
   sessionID: "s", id, role: "assistant", cost, tokens,
   providerID: "github-copilot", modelID: "gpt-6-luna", time: { created },
@@ -37,14 +39,14 @@ t.ingest(msg("m2", 0.2, { input: 800, output: 150, reasoning: 50, cache: { read:
 t.ingest(msg("m1", 0.6, { input: 1000, output: 200, reasoning: 0, cache: { read: 5000, write: 100 } }, 0)); // update, not add
 const line = await t.emit("s");
 assert.match(line, /\$0\.8000/);
-assert.match(line, /1s$/);
+assert.match(line, /1s\n/);
 assert.equal(toasts.length, 1);
 assert.equal(toasts[0].title, "stats");
 assert.equal(logs.length, 1);
 assert.equal(await t.emit("s"), null); // unchanged -> no repeat
 
 // costless session is skipped
-const t2 = createTracker({}, client);
+const t2 = createTracker(noPersist(), client);
 t2.ingest(msg("z", 0, { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, 0));
 assert.equal(await t2.emit("s"), null);
 

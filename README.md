@@ -62,14 +62,23 @@ For a standalone Deep Review v3 report written by the root session, the plugin b
 | `toastDuration` | `8000` | toast duration in ms |
 | `includeReasoning` | `false` | add reasoning tokens |
 | `maxTitle` | `24` | max title column width |
+| `scope` | `"run"` | default on-demand report scope; `run` or `session` |
+| `persist` | `true` | persist normalized history across restart |
+| `stateDirectory` | project-isolated default | optional private state directory override |
 
 Env: `OPENCODE_RUN_STATS_CONFIG`.
 
 ## What it counts
 
-Sums each session's assistant messages: `cost`, `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read` (cache hits) and `tokens.cache.write`. Rows are labelled by the message `mode` (agent name) and the session title; subagent rows are indented. Time is first to last assistant message. It prints once per idle and reprints only when the totals change; costless sessions are skipped.
+Sums each session's assistant messages: `cost`, `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read` (cache hits) and `tokens.cache.write`. Budget tokens are input + output + reasoning; cache is displayed separately. USD completeness is explicit; if any price is missing, the report shows an incomplete known-cost subtotal (a lower bound), not a claimed total. The guard still blocks when that lower bound reaches its USD threshold; below it, the unknown remainder is not treated as safe. Token-bearing usage remains visible despite unknown pricing and `minCost`. Session titles are memory-only and never written to accounting files. Message span is first-to-last assistant message; elapsed duration is derived from each root's earliest persisted message timestamp, so recovery retains start time and concurrent children do not add durations.
 
 `rollup` (default) makes the root session print the whole run — every spawned subagent included, matched through the session tree (`parentID`) — while subagent sessions stay silent. Set `rollup: false` for one row per session.
+
+The `run_stats` tool reports the current run by default; pass `scope: "session"` and optionally a known same-project `sessionID` for a session subtotal. `/run-stats` is registered through the config hook as a prompt-template command and preserves a user-defined command with that name. Reports include availability, budget tokens, span/elapsed definitions and any valid read-only cost-guard budget summary. The summary is unavailable unless the shared versioned `opencode-cost-guard-budget-v1` budget field is available; it does not write guard state.
+
+Normalized persisted records include usage, session IDs/ancestry, start timestamps, and mode/model metadata—never prompts or session titles. Project/worktree-keyed immutable journal events publish through unique temporary files and atomic rename; readers ignore leftovers. Replay is idempotent and permutation-invariant, with live telemetry preferred over recovery fills. Journal replay has bounded record/byte limits and reports explicit failures; this release does not compact or delete journal history. SDK recovery gaps remain explicit. Run elapsed duration uses the earliest accounted timestamp across the descendant tree. Guard budgets are visible only for a fresh lease from live same-host guard processes; expired, conflicting, disabled, or missing configuration clears availability. Explicit session selectors require successful same-project SDK metadata before report access. This source change does not update installed pinned versions or global config; install a future release or build/copy the local bundle, then restart OpenCode.
+
+Journal publications are delta-only and include stable candidate identities rather than cumulative snapshots. Budget reports calculate root and selected-session totals independently, report canonical approvals and session extensions, and identify per-agent applicability/exclusions. Agent patterns preserve full `*` and `?` glob semantics.
 
 ## Compatibility
 
@@ -78,7 +87,7 @@ v1 (`plugin`) and v2 (`plugins`) share the hook API. Local installs load from `~
 ## Test
 
 ```bash
-npm test && node test/e2e.mjs
+node test/smoke.mjs && node test/deep-review.mjs && node test/accounting.mjs && node test/e2e.mjs
 ```
 
 ## License

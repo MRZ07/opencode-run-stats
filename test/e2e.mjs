@@ -10,6 +10,12 @@ const client = {
 };
 
 const hooks = await RunStats({ client }, { title: "run stats", showLog: true, includeReasoning: true, format: "line" });
+const config = { command: { "run-stats": { description: "user override" } } };
+await hooks.config(config);
+assert.equal(config.command["run-stats"].description, "user override");
+const configWithOther = { command: { "other-command": { template: "keep" } } };
+await hooks.config(configWithOther);
+assert.equal(configWithOther.command["run-stats"].description, "Show current OpenCode run or session usage");
 
 const messageEvent = (id, cost, tokens, created) => ({
   event: {
@@ -63,4 +69,3 @@ assert.match(rootLine, /TOTAL/);
 assert.match(rootLine, /\$0\.6000/);
 assert.equal(toasts2.length, 1);
 console.log("rollup table:\n" + rootLine);
-
