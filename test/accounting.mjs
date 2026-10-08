@@ -337,7 +337,7 @@ try {
   const rootPath = path.join(temp, "project"), statePath = path.join(temp, "explicit-state");
   await fs.mkdir(rootPath, { recursive: true });
   const guardClient = { app: { log: async () => {} }, session: { get: async ({ path: { id } }) => ({ data: { id, directory: rootPath } }) } };
-  const trustedSessionClient = { ...guardClient, session: { get: async ({ path: { id } }) => ({ data: { id, directory: rootPath } }) } };
+  const trustedSessionClient = { ...guardClient, session: { messages: async () => ({ data: [] }), get: async ({ path: { id } }) => ({ data: { id, directory: rootPath, projectID: "integration", parentID: id === "integrated-child" ? "integrated-root" : null } }) } };
   const guardHooks = await CostGuard({ client: trustedSessionClient, directory: { worktree: rootPath } }, { persist: true, stateDirectory: statePath, limit: 5, runLimit: 1, tokenLimit: 200, runTokenLimit: 300, subagentTokenLimit: 250, agents: ["*"], exclude: [], onBlock: "ask" });
   await guardHooks.config({});
   for (const id of ["integrated-root", "integrated-child"]) await guardHooks.event({ event: { type: "session.created", properties: { info: { id,
@@ -375,8 +375,16 @@ try {
   assert.equal(integrationReport.guardSessionBudget.sessionUsdRemaining, 4.4, "root session-only remaining uses root 0.6 session spend");
   assert.equal(integrationReport.guardSessionBudget.runUsdRemaining, undefined);
   assert.equal(integrationReport.guardBudget.costAvailable, true);
-  await guardHooks.tool.cost_guard_extend.execute({ usd: 1, tokens: 100, scope: "run" }, { sessionID: "integrated-root" });
-  await guardHooks.tool.cost_guard_extend.execute({ usd: 0.25, tokens: 50, scope: "session" }, { sessionID: "integrated-child" });
+  const approveExtension = async (hooks, args) => {
+    const context = { sessionID: "integrated-root" };
+    const text = await hooks.tool.cost_guard_extend.execute(args, context);
+    const question = JSON.parse(text.match(/with (.*), then retry/)[1]);
+    await hooks["tool.execute.after"]({ tool: "question", sessionID: context.sessionID, args: question },
+      { metadata: { answers: [["Approve"]] } });
+    return hooks.tool.cost_guard_extend.execute(args, context);
+  };
+  await approveExtension(guardHooks, { usd: 1, tokens: 100, scope: "run" });
+  await approveExtension(guardHooks, { usd: 0.25, tokens: 50, scope: "session", sessionID: "integrated-child" });
   const afterApproval = await readStore({ directory: statePath, filename: "cost-guard.json", projectDirectory: rootPath });
   assert.equal(afterApproval.approvals.length, 2);
   const extendedReport = JSON.parse(await stats.tool.run_stats.execute({}, { sessionID: "integrated-root" }));
@@ -385,7 +393,7 @@ try {
   assert.equal(extendedReport.guardSessionBudget.sessionUsdRemaining, 4.4, "child session approval does not contaminate root session report");
   const equivalentGuard = await CostGuard({ client: trustedSessionClient, directory: { worktree: rootPath } }, { persist: true, stateDirectory: statePath, limit: 5, runLimit: 1, tokenLimit: 200, runTokenLimit: 300, subagentTokenLimit: 250, agents: ["*"], exclude: [], onBlock: "ask" });
   await equivalentGuard.config({});
-  await equivalentGuard.tool.cost_guard_extend.execute({ usd: 0.5, tokens: 50, scope: "run" }, { sessionID: "integrated-root" });
+  await approveExtension(equivalentGuard, { usd: 0.5, tokens: 50, scope: "run" });
   const combinedApprovals = JSON.parse(await stats.tool.run_stats.execute({}, { sessionID: "integrated-root" }));
   assert.equal(combinedApprovals.guardBudget.runUsdLimit, 2.5, "equivalent active writers contribute independently published approvals");
   assert.equal(combinedApprovals.guardBudget.extensions.runUsd, 1.5);
