@@ -15,7 +15,7 @@ OpenCode v2 (tested on 2.0.25):
 
 ```jsonc
 "plugins": [{
-  "package": "github:MRZ07/opencode-run-stats#v0.3.2",
+  "package": "github:MRZ07/opencode-run-stats#v0.3.3",
   "options": { "format": "table", "minCost": 0, "showToast": true }
 }]
 ```
@@ -27,7 +27,7 @@ Reload the plugin or start a fresh OpenCode instance after updating. A copied si
 OpenCode v1.18.29+ uses the same default export's `server()` implementation:
 
 ```jsonc
-"plugin": [["github:MRZ07/opencode-run-stats#v0.3.2", { "format": "table", "minCost": 0 }]]
+"plugin": [["github:MRZ07/opencode-run-stats#v0.3.3", { "format": "table", "minCost": 0 }]]
 ```
 
 The v1 implementation retains message events and server-driven toasts; its older behavior is covered by unit tests, not a live v1 host test. Earlier v1 releases are not supported by this dual entrypoint. See the [official migration guide](https://opencode.ai/v2/docs/build/plugins/migrate-v1) and [CLI plugin API](https://opencode.ai/v2/docs/build/plugins/cli/).

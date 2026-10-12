@@ -1,6 +1,6 @@
 {
   "name": "opencode-run-stats",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "opencode plugin: at the end of a run, print input/output tokens, cache read/write, cost in USD and time \u2014 computed from events, no model call.",
   "type": "module",
   "main": "index.js",
