@@ -1,9 +1,10 @@
 /**
  * Build a single-file local plugin: dist/opencode-run-stats.js
  *
- * opencode (v1 and v2) auto-loads every .js file and package directory under
+ * opencode auto-loads plugin files and package directories under
  * ~/.config/opencode/plugins/ and registers every exported function as a
- * plugin. One file that exports only RunStats avoids double-loading.
+ * plugin. One default definition avoids double-loading. The v2 TUI needs
+ * the package ./tui export; install the package for native toast output.
  *
  * Requires Bun (opencode ships it): bun build.
  */

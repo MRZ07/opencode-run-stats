@@ -1,7 +1,7 @@
 {
   "name": "opencode-run-stats",
-  "version": "0.3.1",
-  "description": "opencode plugin: at the end of a run, print input/output tokens, cache read/write, cost in USD and time — computed from events, no model call.",
+  "version": "0.3.2",
+  "description": "opencode plugin: at the end of a run, print input/output tokens, cache read/write, cost in USD and time \u2014 computed from events, no model call.",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
@@ -9,14 +9,33 @@
     ".": {
       "import": "./index.js",
       "types": "./index.d.ts"
-    }
+    },
+    "./tui": "./tui.js"
   },
-  "files": ["index.js", "tracker.js", "lib.js", "index.d.ts", "dist", "README.md", "LICENSE"],
+  "files": [
+    "index.js",
+    "tracker.js",
+    "lib.js",
+    "index.d.ts",
+    "dist",
+    "README.md",
+    "LICENSE",
+    "native.js",
+    "tui.js",
+    "options.js"
+  ],
   "scripts": {
-    "test": "node test/smoke.mjs",
+    "test": "node test/smoke.mjs && node test/native.mjs",
     "build:local": "node build-local.mjs"
   },
-  "keywords": ["opencode", "opencode-plugin", "tokens", "cost", "stats", "usage"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tokens",
+    "cost",
+    "stats",
+    "usage"
+  ],
   "license": "MIT",
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1"

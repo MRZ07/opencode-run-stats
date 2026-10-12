@@ -152,10 +152,12 @@ function createTracker(options, client) {
   const treeOf = (root) => {
     const out = [root];
     const stack = [root];
+    const seen = new Set(stack);
     while (stack.length) {
       const cur = stack.pop();
       for (const [id, pid] of parents) {
-        if (pid === cur) {
+        if (pid === cur && !seen.has(id)) {
+          seen.add(id);
           out.push(id);
           stack.push(id);
         }
@@ -189,7 +191,7 @@ function createTracker(options, client) {
     depth: depthOf(id),
     ...summarize(sessions.get(id))
   });
-  const emit = async (sessionID) => {
+  const emit = async (sessionID, { force = false } = {}) => {
     const isSubagent = parents.get(sessionID) != null;
     if (cfg.rollup && isSubagent)
       return null;
@@ -198,13 +200,13 @@ function createTracker(options, client) {
     const total = summarizeMany(present.map((id) => sessions.get(id)));
     if (total.turns === 0)
       return null;
-    if (total.cost === 0 && total.input === 0 && total.output === 0)
+    if (!force && total.cost === 0 && total.input === 0 && total.output === 0)
       return null;
     if (total.cost < cfg.minCost)
       return null;
     const key = [total.turns, total.cost, total.input, total.output, total.cacheRead, total.cacheWrite, total.ms].join("|");
     const root = get(sessionID);
-    if (root.printedKey === key)
+    if (!force && root.printedKey === key)
       return null;
     root.printedKey = key;
     const text = cfg.format === "table" ? formatTable(present.map(rowFor), { includeReasoning: cfg.includeReasoning, maxTitle: cfg.maxTitle, total }) : formatLine({ ...total, includeReasoning: cfg.includeReasoning });
@@ -227,10 +229,19 @@ function createTracker(options, client) {
     parents.delete(id);
     titles.delete(id);
   };
-  return { ingest, ingestSession, emit, forget, _sessions: sessions, _cfg: cfg };
+  const ingestSnapshot = (info) => {
+    ingestSession(info);
+    const s = get(info.id);
+    s.messages = new Map([["native-total", { cost: info.cost, tokens: info.tokens }]]);
+    s.modes = new Map(info.agent ? [[info.agent, 1]] : []);
+    s.models = new Set(info.model ? [`${info.model.providerID}/${info.model.id}`] : []);
+    s.first = info.time?.created;
+    s.last = info.time?.idle ?? info.time?.updated;
+  };
+  return { ingest, ingestSession, ingestSnapshot, emit, forget, _sessions: sessions, _cfg: cfg };
 }
 
-// index.js
+// options.js
 async function loadFileOptions() {
   try {
     const fs = await import("node:fs/promises");
@@ -242,6 +253,99 @@ async function loadFileOptions() {
     return null;
   }
 }
+
+// native.js
+import { resolve } from "node:path";
+var terminal = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"]);
+function createNativeReporter(options, host) {
+  let unavailable = 0;
+  const annotate = (body) => unavailable ? {
+    ...body,
+    message: `Usage incomplete: ${unavailable} session(s) unavailable
+${body.message}`,
+    ...body.extra ? { extra: { ...body.extra, incomplete: true } } : {}
+  } : body;
+  const tracker = createTracker(options, {
+    app: { log: async ({ body }) => host.log?.(annotate(body)) },
+    tui: { showToast: async ({ body }) => host.toast?.(annotate(body)) }
+  });
+  const known = new Set;
+  const completed = new Set;
+  const settled = new Set;
+  const belongs = (info) => info?.id && info.location?.directory && resolve(info.location.directory) === resolve(host.location.directory) && (!host.location.project?.id || info.projectID === host.location.project.id);
+  const load = async (id) => {
+    const info = await host.get(id);
+    if (!belongs(info))
+      return null;
+    known.add(id);
+    tracker.ingestSnapshot(info);
+    return info;
+  };
+  const handle = async (event) => {
+    let id = event.data?.sessionID;
+    if (!id)
+      return;
+    if (event.location?.directory && resolve(event.location.directory) !== resolve(host.location.directory))
+      return;
+    if (event.type === "session.deleted") {
+      known.delete(id);
+      settled.delete(id);
+      tracker.forget(id);
+      return;
+    }
+    if (!event.type.startsWith("session."))
+      return;
+    known.add(id);
+    if (event.type === "session.execution.started")
+      settled.delete(id);
+    const correction = event.type === "session.usage.updated" && settled.has(id);
+    if (!terminal.has(event.type) && !correction)
+      return;
+    if (event.id && completed.has(event.id))
+      return;
+    unavailable = 0;
+    let info = await load(id);
+    if (!info)
+      return;
+    settled.add(id);
+    if (tracker._cfg.rollup && info.parentID) {
+      if (!correction)
+        return;
+      const seen = new Set([id]);
+      while (info.parentID) {
+        id = info.parentID;
+        if (seen.has(id) || !settled.has(id))
+          return;
+        seen.add(id);
+        info = await load(id);
+        if (!info)
+          return;
+      }
+    }
+    for (const member of host.family?.(id) || [])
+      known.add(member);
+    const candidates = (host.family ? host.family(id) : [...known]).filter((member) => member !== id);
+    for (const member of candidates) {
+      try {
+        await load(member);
+      } catch {
+        unavailable++;
+        tracker.forget(member);
+      }
+    }
+    const text = await tracker.emit(id, { force: !correction });
+    if (event.id) {
+      completed.add(event.id);
+      if (completed.size > 1024)
+        completed.delete(completed.values().next().value);
+    }
+    return text && unavailable ? `Usage incomplete: ${unavailable} session(s) unavailable
+${text}` : text;
+  };
+  return { handle };
+}
+
+// index.js
 var RunStats = async ({ client }, options) => {
   const fileOptions = await loadFileOptions();
   const tracker = createTracker({ ...fileOptions || {}, ...options || {} }, client);
@@ -261,8 +365,35 @@ var RunStats = async ({ client }, options) => {
     }
   };
 };
-var opencode_run_stats_default = RunStats;
+var opencode_run_stats_v2_default = {
+  id: "opencode-run-stats",
+  server: RunStats,
+  async setup(ctx) {
+    const options = { ...await loadFileOptions() || {}, ...ctx.options };
+    const reporter = createNativeReporter(options, {
+      location: ctx.location,
+      get: (sessionID) => ctx.session.get({ sessionID }),
+      log: (body) => console.info(JSON.stringify({ service: "run-stats", ...body }))
+    });
+    const controller = new AbortController;
+    const consumer = (async () => {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        try {
+          await reporter.handle(event);
+        } catch {
+          console.error("run-stats: session summary unavailable");
+        }
+      }
+    })().catch(() => {
+      if (!controller.signal.aborted)
+        console.error("run-stats: event subscription ended unexpectedly");
+    });
+    return async () => {
+      controller.abort();
+      await consumer;
+    };
+  }
+};
 export {
-  RunStats,
-  opencode_run_stats_default as default
+  opencode_run_stats_v2_default as default
 };

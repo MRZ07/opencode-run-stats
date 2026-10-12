@@ -33,18 +33,14 @@ export interface RunStats {
   model: string | null;
 }
 
-export declare function fmtTokens(n: number): string;
-export declare function fmtDuration(ms: number): string;
-export declare function fmtUsd(n: number): string;
-export declare function summarize(s: unknown): RunStats;
-export declare function summarizeMany(list: unknown[]): RunStats;
-export declare function formatLine(s: RunStats & { includeReasoning?: boolean }): string;
-export declare function formatTable(
-  rows: Array<Partial<RunStats> & { agent?: string; title?: string; depth?: number }>,
-  opts?: { includeReasoning?: boolean; maxTitle?: number; total?: Partial<RunStats> },
-): string;
-export declare function formatBlock(s: RunStats): string;
-export declare function normalizeOptions(options?: PluginOptions): Required<RunStatsOptions>;
-
-export declare const RunStats: Plugin;
-export default RunStats;
+declare const plugin: {
+  id: "opencode-run-stats";
+  server: Plugin;
+  setup(context: {
+    options: Record<string, unknown>;
+    location: { directory: string; project?: { id: string } };
+    session: { get(input: { sessionID: string }): Promise<unknown> };
+    event: { subscribe(options: { signal: AbortSignal }): AsyncIterable<unknown> };
+  }): Promise<() => Promise<void>>;
+};
+export default plugin;

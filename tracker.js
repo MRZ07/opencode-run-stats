@@ -49,10 +49,12 @@ export function createTracker(options, client) {
   const treeOf = (root) => {
     const out = [root];
     const stack = [root];
+    const seen = new Set(stack);
     while (stack.length) {
       const cur = stack.pop();
       for (const [id, pid] of parents) {
-        if (pid === cur) {
+        if (pid === cur && !seen.has(id)) {
+          seen.add(id);
           out.push(id);
           stack.push(id);
         }
@@ -87,7 +89,7 @@ export function createTracker(options, client) {
     ...summarize(sessions.get(id)),
   });
 
-  const emit = async (sessionID) => {
+  const emit = async (sessionID, { force = false } = {}) => {
     const isSubagent = parents.get(sessionID) != null;
     if (cfg.rollup && isSubagent) return null;
 
@@ -96,12 +98,12 @@ export function createTracker(options, client) {
     const total = summarizeMany(present.map((id) => sessions.get(id)));
 
     if (total.turns === 0) return null;
-    if (total.cost === 0 && total.input === 0 && total.output === 0) return null;
+    if (!force && total.cost === 0 && total.input === 0 && total.output === 0) return null;
     if (total.cost < cfg.minCost) return null;
 
     const key = [total.turns, total.cost, total.input, total.output, total.cacheRead, total.cacheWrite, total.ms].join("|");
     const root = get(sessionID);
-    if (root.printedKey === key) return null;
+    if (!force && root.printedKey === key) return null;
     root.printedKey = key;
 
     const text =
@@ -134,5 +136,17 @@ export function createTracker(options, client) {
     titles.delete(id);
   };
 
-  return { ingest, ingestSession, emit, forget, _sessions: sessions, _cfg: cfg };
+  // V2 exposes cumulative session usage including title/compaction requests.
+  // Replace the snapshot, never add it to per-step or previous snapshot usage.
+  const ingestSnapshot = (info) => {
+    ingestSession(info);
+    const s = get(info.id);
+    s.messages = new Map([["native-total", { cost: info.cost, tokens: info.tokens }]]);
+    s.modes = new Map(info.agent ? [[info.agent, 1]] : []);
+    s.models = new Set(info.model ? [`${info.model.providerID}/${info.model.id}`] : []);
+    s.first = info.time?.created;
+    s.last = info.time?.idle ?? info.time?.updated;
+  };
+
+  return { ingest, ingestSession, ingestSnapshot, emit, forget, _sessions: sessions, _cfg: cfg };
 }

@@ -1,82 +1,66 @@
 # opencode-run-stats
 
-Prints a run's token, cost and time when it ends. Plain code reads opencode's own event data and formats it — no model call, so it costs zero tokens.
+Displays a cost and token table after a task finishes. Arithmetic and formatting only: no model request, prompt injection, budget limit or workflow gate.
 
+```text
+agent              title              in  out  cache r/w    cost  time
+fusion-planner     Fix slope edges    12k  4.5k    1.2M/8k   $1.20  5m12s
+  fusion-ops       commit fix         2k   400     90k/1k  $0.0100    30s
+TOTAL                               14k  4.9k   1.3M/9k    $1.21  5m12s
 ```
-agent              title                 in  out  cache r/w     cost  time
-─────────────────  ───────────────────  ───  ───  ─────────  ───────  ────
-fusion-planner     Fix slope edges      12k  4.5k    1.2M/8k    $1.20  5m12s
-  fusion-explorer  explore slope joins   3k   900    200k/2k  $0.0500     1m
-  fusion-ops       commit slope fix      2k   400     90k/1k  $0.0100    30s
-─────────────────  ───────────────────  ───  ───  ─────────  ───────  ────
-TOTAL                                   17k  5.8k   1.5M/11k    $1.26  5m42s
-```
-
-One row per session (parent plus spawned subagents), labelled by agent and session title, plus a total. Shown as a toast, optionally as a log line.
-
-## It costs nothing
-
-opencode already records `cost` and `tokens` on every assistant message. The plugin sums those event fields and renders a table. It never calls a model, so it adds no tokens and no latency.
 
 ## Install
 
-GitHub, v1:
+OpenCode v2 (tested on 2.0.25):
 
 ```jsonc
-"plugin": ["github:MRZ07/opencode-run-stats"]
+"plugins": [{
+  "package": "github:MRZ07/opencode-run-stats#v0.3.2",
+  "options": { "format": "table", "minCost": 0, "showToast": true }
+}]
 ```
 
-GitHub, v2:
+The package's `./tui` entry loads automatically. It shows the table as a toast after each root task succeeds, fails or is interrupted, including zero USD tasks. `/run-stats` opens the last table again without a model call. Helpers appear in the root's table with the default `rollup: true`. End-of-session interruption is covered while the host remains running; terminating the process cannot guarantee a final event or table.
+
+Reload the plugin or start a fresh OpenCode instance after updating. A copied single-file server bundle cannot provide v2 terminal toasts by itself: use the package install. Remote TUI users may also configure the package in `cli.json`.
+
+OpenCode v1.18.29+ uses the same default export's `server()` implementation:
 
 ```jsonc
-"plugins": ["github:MRZ07/opencode-run-stats"]
+"plugin": [["github:MRZ07/opencode-run-stats#v0.3.2", { "format": "table", "minCost": 0 }]]
 ```
 
-Pin a release with `#v0.3.0`.
+The v1 implementation retains message events and server-driven toasts; its older behavior is covered by unit tests, not a live v1 host test. Earlier v1 releases are not supported by this dual entrypoint. See the [official migration guide](https://opencode.ai/v2/docs/build/plugins/migrate-v1) and [CLI plugin API](https://opencode.ai/v2/docs/build/plugins/cli/).
 
-Options, v1 tuple / v2 object:
-
-```jsonc
-// v1
-"plugin": [["github:MRZ07/opencode-run-stats", { "format": "table", "minCost": 0.01 }]]
-// v2
-"plugins": [{ "package": "github:MRZ07/opencode-run-stats", "options": { "format": "table", "minCost": 0.01 } }]
-```
-
-Local install (both versions): copy `dist/opencode-run-stats.js` into `~/.config/opencode/plugins/` and configure with `~/.config/opencode/run-stats.json`.
-
-## Config
+## Options
 
 | Option | Default | Meaning |
 |---|---|---|
 | `format` | `"table"` | `table` or `line` |
-| `minCost` | `0` | skip sessions cheaper than this USD |
-| `rollup` | `true` | root session reports the whole tree; subagents stay silent |
-| `showToast` | `true` | toast at run end |
-| `showLog` | `false` | also write a structured log line |
-| `title` | `"run stats"` | toast title |
-| `toastDuration` | `8000` | toast duration in ms |
-| `includeReasoning` | `false` | add reasoning tokens |
-| `maxTitle` | `24` | max title column width |
+| `minCost` | `0` | Suppress summaries below this USD amount; leave at 0 for every completion |
+| `rollup` | `true` | Root reports its descendants; helpers stay silent |
+| `showToast` | `true` | Show the completion table in the terminal |
+| `showLog` | `false` | Also write a structured server log (headless output in v2) |
+| `title` | `"run stats"` | Toast title |
+| `toastDuration` | `8000` | Toast duration in milliseconds |
+| `includeReasoning` | `false` | Add a reasoning column |
+| `maxTitle` | `24` | Maximum title width |
 
-Env: `OPENCODE_RUN_STATS_CONFIG`.
+Optional file settings: `OPENCODE_RUN_STATS_CONFIG` or `~/.config/opencode/run-stats.json`. Package options override file settings. Disabling output or setting a positive filter intentionally suppresses completion output.
 
-## What it counts
+## Accounting
 
-Sums each session's assistant messages: `cost`, `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read` (cache hits) and `tokens.cache.write`. Rows are labelled by the message `mode` (agent name) and the session title; subagent rows are indented. Time is first to last assistant message. It prints once per idle and reprints only when the totals change; costless sessions are skipped.
+V2 reads cumulative native session totals: cost, input/output/reasoning tokens, and cache read/write. These totals include native auxiliary title and compaction usage. A new snapshot replaces the previous one; repeated usage events never add the same tokens again. Each row covers the session's lifetime, not only its most recent user prompt. The total time spans the earliest session creation to the latest idle/update timestamp; concurrent helper durations are not added together. Agent/model labels use the latest native session metadata.
 
-`rollup` (default) makes the root session print the whole run — every spawned subagent included, matched through the session tree (`parentID`) — while subagent sessions stay silent. Set `rollup: false` for one row per session.
+The TUI discovers descendants from its session family cache, including helpers observed before plugin startup. Headless server logs include the sessions observed by this plugin instance; unseen prior descendants cannot be recovered through the restricted server plugin session API. Unavailable known-session snapshots mark output incomplete. Native USD is reported as provided by OpenCode, without estimating vendor billing. V2 emits on every distinct completion event; repeated delivery of the same event is suppressed. Late auxiliary usage updates refresh a finished root table; an unchanged snapshot produces no duplicate. Subscriptions/listeners stop on plugin unload.
 
-## Compatibility
+## Tests
 
-v1 (`plugin`) and v2 (`plugins`) share the hook API. Local installs load from `~/.config/opencode/plugins/` on both. Ship the single `dist/opencode-run-stats.js` file — opencode registers every exported function as a plugin, so a single file that exports only `RunStats` avoids double-loading.
-
-## Test
-
-```bash
-node test/smoke.mjs && node test/e2e.mjs
+```sh
+npm test
+npm run build:local
 ```
 
-## License
+`test/native.mjs` checks cumulative accounting, rollup, project filtering, all completion outcomes, zero-cost output, TUI options, `/run-stats` and cleanup. The native host fixture in `test/host.mjs` exercises a private OpenCode v2 server using an unpaid localhost model.
 
 MIT

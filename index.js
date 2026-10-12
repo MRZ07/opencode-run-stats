@@ -9,22 +9,11 @@
  */
 import { createTracker } from "./tracker.js";
 
-/** Optional config file for local installs, where the plugin tuple can't pass options. */
-async function loadFileOptions() {
-  try {
-    const fs = await import("node:fs/promises");
-    const p =
-      process.env.OPENCODE_RUN_STATS_CONFIG ||
-      (process.env.HOME ? `${process.env.HOME}/.config/opencode/run-stats.json` : null);
-    if (!p) return null;
-    return JSON.parse(await fs.readFile(p, "utf8"));
-  } catch {
-    return null;
-  }
-}
+import { loadFileOptions } from "./options.js";
+import { createNativeReporter } from "./native.js";
 
 /** @type {import("@opencode-ai/plugin").Plugin} */
-export const RunStats = async ({ client }, options) => {
+const RunStats = async ({ client }, options) => {
   const fileOptions = await loadFileOptions();
   const tracker = createTracker({ ...(fileOptions || {}), ...(options || {}) }, client);
 
@@ -44,4 +33,25 @@ export const RunStats = async ({ client }, options) => {
   };
 };
 
-export default RunStats;
+export default {
+  id: "opencode-run-stats",
+  server: RunStats,
+  async setup(ctx) {
+    const options = { ...(await loadFileOptions() || {}), ...ctx.options };
+    const reporter = createNativeReporter(options, {
+      location: ctx.location,
+      get: (sessionID) => ctx.session.get({ sessionID }),
+      log: (body) => console.info(JSON.stringify({ service: "run-stats", ...body })),
+    });
+    const controller = new AbortController();
+    const consumer = (async () => {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        try { await reporter.handle(event); }
+        catch { console.error("run-stats: session summary unavailable"); }
+      }
+    })().catch(() => {
+      if (!controller.signal.aborted) console.error("run-stats: event subscription ended unexpectedly");
+    });
+    return async () => { controller.abort(); await consumer; };
+  },
+};
