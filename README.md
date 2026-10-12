@@ -60,9 +60,9 @@ For a standalone Deep Review v3 report written by the root session, the plugin b
 | `showLog` | `false` | also write a structured log line |
 | `title` | `"run stats"` | toast title |
 | `toastDuration` | `8000` | toast duration in ms |
-| `includeReasoning` | `false` | add reasoning tokens |
+| `includeReasoning` | `false` | add a reasoning column to rendered tables (JSON per-instance reasoning is always included) |
 | `maxTitle` | `24` | max title column width |
-| `scope` | `"run"` | default on-demand report scope; `run` or `session` |
+| `scope` | unset | explicit idle and on-demand report scope; `run` or `session`. Overrides `rollup`; per-call scope wins. When omitted, idle output retains legacy `rollup` behavior and on-demand reports default to `run`. A configured `run` report is emitted only by the root session, including when `rollup: false`. |
 | `persist` | `true` | persist normalized history across restart |
 | `stateDirectory` | project-isolated default | optional private state directory override |
 
@@ -74,7 +74,7 @@ Sums each session's assistant messages: `cost`, `tokens.input`, `tokens.output`,
 
 `rollup` (default) makes the root session print the whole run — every spawned subagent included, matched through the session tree (`parentID`) — while subagent sessions stay silent. Set `rollup: false` for one row per session.
 
-The `run_stats` tool reports the current run by default; pass `scope: "session"` and optionally a known same-project `sessionID` for a session subtotal. `/run-stats` is registered through the config hook as a prompt-template command and preserves a user-defined command with that name. Reports include availability, budget tokens, span/elapsed definitions and any valid read-only cost-guard budget summary. Child cap applicability, configured base availability, effective extension-adjusted base and active token dimensions are separate optional projections; null means that dimension is inactive, while unknown ancestry reports unavailable attribution rather than root. The summary is unavailable unless the shared versioned `opencode-cost-guard-budget-v1` budget field is available; it does not write guard state.
+The `run_stats` tool reports the current run by default; pass `scope: "session"` and optionally a known same-project `sessionID` for a session subtotal. `/run-stats` is registered through the config hook as a prompt-template command and preserves a user-defined command with that name. Reports include additive per-session `instances` with full IDs in JSON and collision-safe short IDs in rendered tables, transient title, agent/model, known cost lower bound and availability, input/output/reasoning/cache tokens, budget token totals, token completeness and message duration. Aggregate fields remain available. `includeReasoning` controls only the rendered reasoning column; JSON instance reasoning is always explicit. Reports also include availability, budget tokens, span/elapsed definitions and any valid read-only cost-guard budget summary. Child cap applicability, configured base availability, effective extension-adjusted base and active token dimensions are separate optional projections; null means that dimension is inactive, while unknown ancestry reports unavailable attribution rather than root. The summary is unavailable unless the shared versioned `opencode-cost-guard-budget-v1` budget field is available; it does not write guard state.
 
 Normalized persisted records include usage, session IDs/ancestry, start timestamps, and mode/model metadata—never prompts or session titles. Project/worktree-keyed immutable journal events publish through unique temporary files and atomic rename; readers ignore leftovers. Replay is idempotent and permutation-invariant, with live telemetry preferred over recovery fills. Journal replay has bounded record/byte limits and reports explicit failures; this release does not compact or delete journal history. SDK recovery gaps remain explicit. Run elapsed duration uses the earliest accounted timestamp across the descendant tree. Guard budgets are visible only for a fresh lease from live same-host guard processes; expired, conflicting, disabled, or missing configuration clears availability. Explicit session selectors require successful same-project SDK metadata before report access. This source change does not update installed pinned versions or global config; install a future release or build/copy the local bundle, then restart OpenCode.
 
@@ -91,6 +91,14 @@ v1 (`plugin`) and v2 (`plugins`) share the hook API. Local installs load from `~
 ```bash
 node test/smoke.mjs && node test/deep-review.mjs && node test/accounting.mjs && node test/e2e.mjs
 ```
+
+## Journal replay measurement
+
+Run `npm run bench:journal` in this repository to use its bundled shared-engine implementation. It creates private temporary journals with 100, 1,000, and 5,000 distinct message events, then measures one initial and exactly three sequential reloads per corpus. Generation and semantic assertions are outside timing; output includes event counts, bytes, OS/Node environment, and elapsed times, with no hardware-independent speed claim. The harness removes only its own temporary root.
+
+## Disposable host smoke recipe
+
+This is a manual, no-model check; it was not run as part of source implementation. First verify the host's documented support for `OPENCODE_CONFIG_DIR`, `XDG_CONFIG_HOME`, and `XDG_STATE_HOME` for your exact OpenCode version. If any setting is unsupported or isolation is unclear, stop rather than use a live profile. Use temporary HOME/config/state/cache directories and a minimal test config with only a copied local bundle and no unrelated plugins; do not copy credentials, edit global config, activate a pinned install, or submit a prompt. Start only far enough to verify plugin load and hook registration, then stop and remove only directories created for the test. This smoke check does not validate accounting or runtime budget behavior.
 
 ## License
 

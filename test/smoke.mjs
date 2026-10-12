@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { fmtTokens, fmtDuration, fmtUsd, summarize, formatLine, formatTable } from "../lib.js";
+import { fmtTokens, fmtDuration, fmtUsd, summarize, formatLine, formatTable, normalizeOptions, resolveReportScope } from "../lib.js";
 import { createTracker } from "../tracker.js";
 
 const noPersist = (options = {}) => ({ ...options, persist: false });
 
 // formatting
+assert.equal(resolveReportScope(normalizeOptions({ scope: "session", rollup: true })), "session");
+assert.equal(resolveReportScope(normalizeOptions({ scope: "run", rollup: false }), undefined, true), "run");
+assert.equal(resolveReportScope(normalizeOptions({ rollup: false }), undefined, true), "session");
+assert.equal(resolveReportScope(normalizeOptions({ rollup: false }), undefined), "run");
+assert.equal(resolveReportScope(normalizeOptions({ scope: "session" }), "run"), "run");
 assert.equal(fmtTokens(500), "500");
 assert.equal(fmtTokens(1234), "1.2k");
 assert.equal(fmtTokens(1900000), "1.9M");
@@ -61,9 +66,16 @@ assert.equal(await t2.emit("s"), null);
     ],
     { total: { input: 15000, output: 5400, cacheRead: 1400000, cacheWrite: 10000, cost: 1.25, ms: 312000 } },
   );
-  assert.match(table, /agent\s+title\s+in\s+out\s+cache r\/w\s+cost\s+time/);
+  assert.match(table, /agent \/ id\s+title \/ model\s+in\s+out\s+cache r\/w\s+budget tk\s+cost\s+time/);
   assert.match(table, /fusion-planner/);
   assert.match(table, /\n\s*fusion-ops/); // indented subagent
+  assert.match(table, /budget tk/);
+  assert.match(table, /\[\?\]/);
+  assert.doesNotMatch(table, /reason/);
+  assert.match(formatTable([{ input: 10, output: 20, reasoning: 30, totalTokens: 60, cacheRead: 0, cacheWrite: 0, cost: 1, ms: 0 }], { includeReasoning: true }), /reason/);
+  const collisionTable = formatTable([{ agent: "worker", shortID: "abcdefghi", title: "duplicate title", models: ["z/model", "a/model"],
+    input: 1, output: 2, reasoning: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 6, cost: 0.1, ms: 0 }]);
+  assert.match(collisionTable, /duplicate title \/ a\/model, z\/model/);
   assert.match(table, /TOTAL/);
   assert.match(table, /\$1\.25/);
 }

@@ -35,6 +35,11 @@ try {
   for (const field of ["ms", "model", "elapsedMs"]) assert.equal(Object.hasOwn(run, field), false, `tracker report does not claim formatter-only field ${field}`);
   assert.equal(run.cost, 1.2);
   assert.equal(run.totalTokens, 250);
+  assert.equal(run.instances.length, 2);
+  assert.deepEqual(run.instances.map((instance) => instance.sessionID).sort(), ["left", "right"]);
+  assert.equal(run.instances[0].reasoning, 5);
+  assert.equal(run.instances[0].cacheRead, 50);
+  assert.equal(run.instances[0].totalTokens, 125);
   assert.equal(run.messageSpanMs, 100);
   assert.equal(run.runElapsedMs, 9_900);
   assert.equal((await t.report("root", "session", "left")).cost, 0.6);
@@ -42,6 +47,8 @@ try {
   assert.equal(scopedReport.guardBudget.runID, undefined);
   assert.equal(scopedReport.guardBudget.available, false);
   assert.equal(scopedReport.guardSessionBudget.available, false);
+  assert.equal(scopedReport.instances.length, 1);
+  assert.equal(scopedReport.instances[0].sessionID, "left");
 
   const lateA = newLedger(), lateB = newLedger();
   recordSession(lateA, { id: "late-child", parentID: null }, { receivedAt: 10, writerID: "a", eventID: "late-a" });
@@ -78,6 +85,7 @@ try {
   const checkpointState = path.join(temp, "checkpoint-state");
   const checkpointClient = { app: { log: async () => {} }, session: { messages: async () => ({ data: [] }),
     get: async ({ path: { id } }) => ({ data: { id, directory: projectDirectory, projectID: "checkpoint-project",
+      title: id === "notice-child" ? "refreshed SDK title" : undefined,
       ...(id === "notice-root" ? { parentID: null } : { parentID: "notice-root" }) } }) } };
   const checkpointGuard = await CostGuard({ client: checkpointClient, directory: { worktree: projectDirectory } }, {
     persist: true, stateDirectory: checkpointState, limit: 5, tokenLimit: 100000, subagentTokenLimit: 250000, onBlock: "ask",
@@ -101,7 +109,8 @@ try {
   assert.equal(childCheckpoint.subagentAttributionComplete, true);
   await checkpointTracker.ready;
   const checkpointNotice = await checkpointTracker.checkpointNotice("notice-root");
-  assert.match(checkpointNotice, /notice-child \(bounded title\)/);
+  assert.match(checkpointNotice, /notice-child/);
+  assert.match((await checkpointTracker.report("notice-root", "run")).instances.find((instance) => instance.sessionID === "notice-child").title, /refreshed SDK title/);
   assert.match(checkpointNotice, /\(1\) Evaluate stuck first.*\(2\) Continue only after approval.*\(3\) Stop/);
   assert.match(checkpointNotice, /cost_guard_extend\(\{tokens:250000, sessionID:"notice-child"\}\)/);
   assert.match(checkpointNotice, /Evaluation does not approve or unlock/);
@@ -219,6 +228,40 @@ try {
   assert.equal(report.costAvailable, false);
   assert.equal(report.cost, 0);
   assert.equal(report.costKnownLowerBound, 0);
+  await unknown.ingest({ sessionID: "unknown", id: "incomplete-tokens", role: "assistant", cost: null,
+    tokens: { input: 1, output: 0 }, time: { created: 1 } });
+  const incompleteTokenReport = await unknown.report("unknown", "session");
+  assert.equal(incompleteTokenReport.instances[0].tokenCompleteness, "incomplete");
+  assert.equal(incompleteTokenReport.instances[0].tokensComplete, false);
+  assert.equal(incompleteTokenReport.instances[0].costAvailable, false);
+  assert.equal(incompleteTokenReport.instances[0].costKnownLowerBound, 0);
+  const incompleteRun = await unknown.report("unknown", "run");
+  assert.equal(incompleteRun.cost, 0, "unknown cost does not produce a fabricated nonzero total");
+  assert.equal(incompleteRun.costAvailable, false);
+  assert.equal(incompleteRun.costKnownLowerBound, 0, "unknown cost reports only known subtotal");
+
+  const completenessLogs = [];
+  const completeness = createTracker({ persist: false, showToast: false, showLog: true },
+    { app: { log: async ({ body }) => completenessLogs.push(body.message) } }, () => 0, projectDirectory);
+  await completeness.ingestSession({ id: "completeness", parentID: null, directory: projectDirectory });
+  await completeness.ingest({ sessionID: "completeness", id: "unknown", role: "assistant", cost: null });
+  assert.match(await completeness.emit("completeness"), /tokens incomplete/);
+  assert.equal(await completeness.emit("completeness"), null, "same unavailable snapshot remains deduplicated");
+  await completeness.ingest({ sessionID: "completeness", id: "unknown", role: "assistant", cost: null,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, time: { updated: 1 } });
+  assert.match(await completeness.emit("completeness"), /tokens complete/,
+    "completeness-only changes are part of rendered report identity");
+  assert.equal(await completeness.emit("completeness"), null);
+
+  const unavailableTitle = createTracker({ persist: false }, { app: { log: async () => {} }, session: {
+    get: async () => ({ error: new Error("SDK unavailable") }),
+  } }, () => 0, projectDirectory);
+  await unavailableTitle.ingestSession({ id: "unavailable-title", parentID: null, directory: projectDirectory, title: "old transient title" });
+  await unavailableTitle.ingest(msg("unavailable-title", "usage", 0.2, 1));
+  const unavailableTitleReport = await unavailableTitle.report("unavailable-title", "session");
+  assert.equal(unavailableTitleReport.instances[0].title, null);
+  assert.equal(unavailableTitleReport.instances[0].titleAvailable, false);
+  assert.equal(unavailableTitleReport.instances[0].shortID, "unavaila");
 
   const directory = path.join(temp, "state");
   const first = await createStore({ directory, filename: "stats.json" });
@@ -310,6 +353,61 @@ try {
   assert.equal((await roots.report("root-a")).runElapsedMs, 5000);
   assert.equal((await roots.report("root-b")).runElapsedMs, 1000);
 
+  // Configured scope owns idle output; absent scope retains legacy rollup behavior.
+  const scopedTracker = async (options) => {
+    const tracker = createTracker({ persist: false, showToast: false, ...options }, { app: { log: async () => {} } }, () => 3000, projectDirectory);
+    await tracker.ingestSession({ id: "scope-root", parentID: null, directory: projectDirectory });
+    await tracker.ingestSession({ id: "scope-child", parentID: "scope-root", directory: projectDirectory });
+    await tracker.ingest(msg("scope-root", "root-msg", 0.6, 100));
+    await tracker.ingest(msg("scope-child", "child-msg", 0.6, 200));
+    return tracker;
+  };
+  const configuredSession = await scopedTracker({ scope: "session", rollup: true });
+  assert.match(await configuredSession.emit("scope-root"), /0\.6000/);
+  assert.match(await configuredSession.emit("scope-child"), /0\.6000/);
+  const configuredRun = await scopedTracker({ scope: "run", rollup: false });
+  assert.match(await configuredRun.emit("scope-root"), /\$1\.20/);
+  assert.equal(await configuredRun.emit("scope-child"), null, "run scope does not emit a duplicate child idle report");
+  const legacySession = await scopedTracker({ rollup: false });
+  assert.match(await legacySession.emit("scope-root"), /0\.6000/);
+  assert.match(await legacySession.emit("scope-child"), /0\.6000/);
+
+  // Render identity tracks reasoning/title/config while excluding clock-only churn.
+  let sdkTitle = "initial title", identityClock = 1000;
+  const titleRequests = [];
+  const identity = createTracker({ persist: false }, { app: { log: async () => {} }, session: {
+    get: async ({ path: { id } }) => { titleRequests.push(id); return { data: { id, directory: projectDirectory, projectID: "same", parentID: null, title: sdkTitle } }; },
+  } }, () => identityClock, projectDirectory);
+  await identity.ingestSession({ id: "identity", parentID: null, directory: projectDirectory, projectID: "same" });
+  const identityMessage = (reasoning, updated) => ({ ...msg("identity", "m", 0.2, 100), tokens: { input: 100, output: 20, reasoning, cache: { read: 3, write: 1 } },
+    providerID: "p", modelID: "m", time: { created: 100, updated } });
+  await identity.ingest(identityMessage(5, 1));
+  const identityReport = await identity.report("identity", "session");
+  assert.ok(titleRequests.includes("identity"), `report requests fresh session metadata: ${JSON.stringify(titleRequests)}`);
+  assert.equal(identityReport.instances[0].title, "initial title");
+  const firstIdentity = await identity.emit("identity");
+  assert.match(firstIdentity, /initial title/);
+  assert.match(firstIdentity, /125/, "visible report always displays the total budget token count");
+  identityClock += 60_000;
+  assert.equal(await identity.emit("identity"), null, "clock-only elapsed growth does not alter rendered snapshot identity");
+  sdkTitle = "refreshed title";
+  assert.match(await identity.emit("identity"), /refreshed title/, "current verified SDK title refreshes transient output");
+  await identity.ingest(identityMessage(10, 2));
+  assert.equal((await identity.report("identity", "session")).instances[0].reasoning, 10);
+  const reasoningUpdate = await identity.emit("identity");
+  assert.match(reasoningUpdate, /130/, "updated reasoning changes the visible budget token total");
+
+  const collisions = createTracker({ persist: false }, { app: { log: async () => {} }, session: {
+    get: async ({ path: { id } }) => ({ data: { id, directory: projectDirectory, projectID: "same", parentID: "collision-root", title: "duplicate title" } }),
+  } }, () => 0, projectDirectory);
+  await collisions.ingestSession({ id: "collision-root", parentID: null, directory: projectDirectory, projectID: "same" });
+  for (const id of ["12345678a", "12345678b"]) {
+    await collisions.ingestSession({ id, parentID: "collision-root", directory: projectDirectory, projectID: "same", title: "duplicate title" });
+    await collisions.ingest(msg(id, "m", 0.1, 1));
+  }
+  const collisionReport = await collisions.report("collision-root", "run");
+  assert.deepEqual(collisionReport.instances.map((instance) => instance.shortID).sort(), ["12345678a", "12345678b"]);
+
   await fs.mkdir(path.join(temp, "project"), { recursive: true });
   const reloadRoot = await createStore({ directory: path.join(temp, "reloaded-time"), filename: "stats.json", projectDirectory: path.join(temp, "project") });
   const timeLedger = newLedger();
@@ -371,10 +469,31 @@ try {
   assert.equal(childReport.guardSessionBudget.runUsdOverage, undefined);
   assert.equal(childReport.guardBudget.runTokenLimit, 300);
   assert.equal(childReport.guardBudget.runTokensRemaining, 50);
+  assert.equal(childReport.guardBudget.totalTokens, 250, "session display keeps canonical root-run guard totals");
   assert.equal(childReport.guardSessionBudget.sessionTokensRemaining, 75);
   assert.equal(integrationReport.guardSessionBudget.sessionUsdRemaining, 4.4, "root session-only remaining uses root 0.6 session spend");
   assert.equal(integrationReport.guardSessionBudget.runUsdRemaining, undefined);
   assert.equal(integrationReport.guardBudget.costAvailable, true);
+
+  const idleMessages = [];
+  const idleStats = await RunStats({ client: { ...guardClient,
+    app: { log: async ({ body }) => idleMessages.push(body.message) }, tui: { showToast: async () => {} } },
+    directory: { worktree: rootPath } }, { persist: true, stateDirectory: statePath, scope: "session", rollup: true,
+    showToast: false, showLog: true });
+  for (const id of ["integrated-root", "integrated-child"])
+    await idleStats.event({ event: { type: "session.created", properties: { info: { id,
+      parentID: id === "integrated-root" ? null : "integrated-root", directory: rootPath } } } });
+  await idleStats.event({ event: { type: "message.updated", properties: { info: { ...msg("integrated-root", "priced", 0.6, 1000), role: "assistant" } } } });
+  await idleStats.event({ event: { type: "message.updated", properties: { info: { ...msg("integrated-child", "child-priced", 0.6, 2000), role: "assistant" } } } });
+  await idleStats.event({ event: { type: "session.idle", properties: { sessionID: "integrated-root" } } });
+  await idleStats.event({ event: { type: "session.idle", properties: { sessionID: "integrated-child" } } });
+  assert.equal(idleMessages.length, 2, "configured session scope emits both root and child session reports");
+  for (const message of idleMessages) {
+    assert.match(message, /run USD limit 1/);
+    assert.match(message, /overage 0\.19999999999999996/);
+    assert.match(message, /run token remaining 50/);
+    assert.match(message, /session USD remaining 4\.4/);
+  }
   const approveExtension = async (hooks, args) => {
     const context = { sessionID: "integrated-root" };
     const text = await hooks.tool.cost_guard_extend.execute(args, context);
@@ -443,6 +562,14 @@ try {
   await selectedStats.event({ event: { type: "message.updated", properties: { info: { ...msg("agent-a-run", "priced-child", 0.6, 2000), mode: "agent-a", role: "assistant" } } } });
   const scopedRun = JSON.parse(await selectedStats.tool.run_stats.execute({ scope: "session", sessionID: "agent-a-run" }, { sessionID: "integrated-root" }));
   assert.equal(scopedRun.guardBudget.available, false, "conflicting live guard configuration is unavailable");
+
+  const configScoped = await RunStats({ client: guardClient, directory: { worktree: rootPath } }, { persist: false, scope: "session", rollup: true });
+  await configScoped.event({ event: { type: "session.created", properties: { info: { id: "integrated-root", parentID: null, directory: rootPath } } } });
+  await configScoped.event({ event: { type: "message.updated", properties: { info: { ...msg("integrated-root", "scope-option", 0.6, 4000), role: "assistant" } } } });
+  const perCallScopeWins = JSON.parse(await configScoped.tool.run_stats.execute({ scope: "run" }, { sessionID: "integrated-root" }));
+  assert.equal(perCallScopeWins.scope, "run", "per-call scope overrides configured scope");
+  const configuredScope = JSON.parse(await configScoped.tool.run_stats.execute({}, { sessionID: "integrated-root" }));
+  assert.equal(configuredScope.scope, "session", "explicit configured scope applies to on-demand reports");
 
   await fs.mkdir(path.join(temp, "one"), { recursive: true }); await fs.mkdir(path.join(temp, "two"), { recursive: true });
   const sameCwdOne = await createStore({ directory: statePath, filename: "isolated.json", projectDirectory: path.join(temp, "one") });

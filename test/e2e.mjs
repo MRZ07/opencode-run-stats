@@ -51,7 +51,10 @@ console.log("title=" + toasts[0].title + " duration=" + toasts[0].duration + " l
 // rollup, table: only the root reports, summing spawned subagents, labelled by agent + title
 const toasts2 = [];
 const c2 = { app: { log: async () => {} }, tui: { showToast: async ({ body }) => toasts2.push(body) } };
-const r = createTracker({ title: "run" }, { ...c2, session: { messages: async () => ({ data: [] }) } }, () => Date.now(), process.cwd());
+const r = createTracker({ title: "run" }, { ...c2, session: { messages: async () => ({ data: [] }), get: async ({ path: { id } }) => ({ data: {
+  id, directory: process.cwd(), projectID: "rollup-project", parentID: id === "P" ? null : "P",
+  title: ({ P: "Fix slope edges", A: "explore slope joins", B: "commit slope fix" })[id],
+} }) } }, () => Date.now(), process.cwd());
 await r.ingestSession({ id: "P", parentID: null, directory: process.cwd(), title: "Fix slope edges" });
 await r.ingestSession({ id: "A", parentID: "P", directory: process.cwd(), title: "explore slope joins" });
 await r.ingestSession({ id: "B", parentID: "P", directory: process.cwd(), title: "commit slope fix" });
@@ -62,7 +65,7 @@ await r.ingest(mk("B", "b1", "fusion-ops", 0.3, 300, 30));
 assert.equal(await r.emit("A"), null); // subagent is silent
 assert.equal(await r.emit("B"), null);
 const rootLine = await r.emit("P");
-assert.match(rootLine, /agent\s+title\s+in\s+out\s+cache r\/w\s+cost\s+time/);
+assert.match(rootLine, /agent \/ id\s+title \/ model\s+in\s+out\s+cache r\/w\s+budget tk\s+cost\s+time/);
 assert.match(rootLine, /fusion-planner/);
 assert.match(rootLine, /fusion-explorer/);
 assert.match(rootLine, /Fix slope edges/);

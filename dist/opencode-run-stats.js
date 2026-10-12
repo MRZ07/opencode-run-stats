@@ -42,12 +42,19 @@ function normalizeOptions(options = {}) {
     rollup: options.rollup !== false,
     format: options.format === "line" ? "line" : "table",
     maxTitle: typeof options.maxTitle === "number" && options.maxTitle > 0 ? options.maxTitle : 24,
-    scope: options.scope === "session" ? "session" : "run",
+    scope: options.scope === "session" || options.scope === "run" ? options.scope : null,
     persist: options.persist !== false,
     stateDirectory: typeof options.stateDirectory === "string" ? options.stateDirectory : null,
     guardSummary: options.guardSummary && typeof options.guardSummary === "object" ? options.guardSummary : null,
     now: typeof options.now === "function" ? options.now : null
   };
+}
+function resolveReportScope(options, requested, idle = false) {
+  if (requested === "run" || requested === "session")
+    return requested;
+  if (options.scope === "run" || options.scope === "session")
+    return options.scope;
+  return idle && options.rollup === false ? "session" : "run";
 }
 var pad = (s, w, right) => right ? String(s).padStart(w) : String(s).padEnd(w);
 function formatTable(rows, opts = {}) {
@@ -56,16 +63,21 @@ function formatTable(rows, opts = {}) {
     const t = String(s || "");
     return t.length > maxTitle ? t.slice(0, Math.max(1, maxTitle - 1)) + "…" : t;
   };
+  const modelLabel = (r) => {
+    const models = r.models instanceof Set ? [...r.models] : Array.isArray(r.models) ? r.models : r.model ? String(r.model).split(", ") : [];
+    return models.sort().join(", ");
+  };
   const cols = [
-    { key: "agent", head: "agent", right: false, val: (r) => "  ".repeat(r.depth || 0) + (r.agent || "?") },
-    { key: "title", head: "title", right: false, val: (r) => clip(r.title) },
+    { key: "agent", head: "agent / id", right: false, val: (r) => "  ".repeat(r.depth || 0) + (r.agent === "TOTAL" ? "TOTAL" : `${r.agent || "?"} [${r.shortID || "?"}]`) },
+    { key: "title", head: "title / model", right: false, val: (r) => `${clip(r.title)}${modelLabel(r) ? ` / ${modelLabel(r)}` : ""}` },
     { key: "in", head: "in", right: true, val: (r) => fmtTokens(r.input) },
     { key: "out", head: "out", right: true, val: (r) => fmtTokens(r.output) },
-    { key: "cache", head: "cache r/w", right: true, val: (r) => `${fmtTokens(r.cacheRead)}/${fmtTokens(r.cacheWrite)}` }
+    { key: "cache", head: "cache r/w", right: true, val: (r) => `${fmtTokens(r.cacheRead)}/${fmtTokens(r.cacheWrite)}` },
+    { key: "budgetTokens", head: "budget tk", right: true, val: (r) => fmtTokens(r.totalTokens ?? (r.input || 0) + (r.output || 0) + (r.reasoning || 0)) }
   ];
   if (opts.includeReasoning)
     cols.push({ key: "reason", head: "reason", right: true, val: (r) => fmtTokens(r.reasoning) });
-  cols.push({ key: "cost", head: "cost", right: true, val: (r) => r.costAvailable === false ? "unavailable" : fmtUsd(r.cost) });
+  cols.push({ key: "cost", head: "cost", right: true, val: (r) => r.costAvailable === false ? `>=${fmtUsd(r.costKnownLowerBound ?? r.cost)}` : fmtUsd(r.cost) });
   cols.push({ key: "time", head: "time", right: true, val: (r) => fmtDuration(r.ms) });
   const all = opts.total ? [...rows, { agent: "TOTAL", title: "", depth: 0, ...opts.total }] : rows;
   const widths = cols.map((c) => Math.max(c.head.length, ...all.map((r) => String(c.val(r)).length)));
@@ -93,6 +105,24 @@ var MAX_STATE_BYTES = 8 * 1024 * 1024;
 var MAX_JOURNAL_RECORDS = 1e5;
 var MAX_JOURNAL_BYTES = 64 * 1024 * 1024;
 var CONFIG_LEASE_MS = 5 * 60000;
+var views = new WeakMap;
+var invalidateView = (ledger) => views.delete(ledger);
+var view = (ledger) => {
+  let cached = views.get(ledger);
+  if (!cached) {
+    cached = { ledger: normalizeLedger(ledger), totals: null };
+    views.set(ledger, cached);
+  }
+  return cached;
+};
+var freeze = (value) => {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value))
+      freeze(child);
+    Object.freeze(value);
+  }
+  return value;
+};
 var finite = (n) => typeof n === "number" && Number.isFinite(n) && n >= 0;
 function normalizeUsage(info = {}) {
   const t = info.tokens || {};
@@ -153,7 +183,7 @@ function recordMessage(ledger, info, { recovered = false, receivedAt = Date.now(
     sessionID: info.sessionID,
     id: info.id,
     usage: normalizeUsage(info),
-    mode: typeof info.mode === "string" ? info.mode : null,
+    mode: typeof info.agent === "string" ? info.agent : typeof info.mode === "string" ? info.mode : null,
     model: info.providerID && info.modelID ? `${info.providerID}/${info.modelID}` : null,
     createdAt: Number.isFinite(info.time?.created) ? info.time.created : null,
     updatedAt: Number.isFinite(info.time?.updated) ? info.time.updated : null,
@@ -168,12 +198,14 @@ function recordMessage(ledger, info, { recovered = false, receivedAt = Date.now(
   return mergeRecord(ledger, record);
 }
 function mergeRecord(target, incoming) {
+  invalidateView(target);
   const key = messageKey(incoming.sessionID, incoming.id);
   const prior = target.messages[key];
   target.messages[key] = winner([...prior ? [prior] : [], incoming]);
   return target.messages[key].eventID === incoming.eventID;
 }
 function recordSession(ledger, info, event = {}) {
+  invalidateView(ledger);
   if (!info || typeof info.id !== "string" || !info.id)
     return;
   const prior = ledger.sessions[info.id] || { parentID: null, startAt: null, metadata: {} };
@@ -353,36 +385,35 @@ function deltaLedger(before, after) {
     delta.budget = after.budget;
   return delta;
 }
+var emptyTotals = () => ({
+  cost: 0,
+  costKnownLowerBound: 0,
+  costAvailable: true,
+  tokensComplete: true,
+  input: 0,
+  output: 0,
+  reasoning: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  turns: 0,
+  first: null,
+  last: null,
+  models: new Set
+});
 function aggregate(ledger, sessionIDs) {
-  const ids = new Set(sessionIDs), out = {
-    cost: 0,
-    costKnownLowerBound: 0,
-    costAvailable: true,
-    tokensComplete: true,
-    input: 0,
-    output: 0,
-    reasoning: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    turns: 0,
-    first: null,
-    last: null,
-    models: new Set
-  };
-  const normalized = normalizeLedger(ledger);
-  for (const record of Object.values(normalized.messages))
-    if (ids.has(record.sessionID)) {
+  const cached = view(ledger);
+  if (!cached.totals) {
+    cached.totals = new Map;
+    for (const record of Object.values(cached.ledger.messages)) {
+      const out = cached.totals.get(record.sessionID) || emptyTotals();
       out.turns++;
       out.costAvailable &&= record.usage.costKnown;
       if (record.usage.costKnown)
         out.cost += record.usage.cost;
       out.tokensComplete &&= record.usage.tokensComplete;
-      out.input += record.usage.tokens.input;
-      out.output += record.usage.tokens.output;
-      out.reasoning += record.usage.tokens.reasoning;
-      out.cacheRead += record.usage.tokens.cacheRead;
-      out.cacheWrite += record.usage.tokens.cacheWrite;
+      for (const key of ["input", "output", "reasoning", "cacheRead", "cacheWrite"])
+        out[key] += record.usage.tokens[key];
       out.totalTokens += record.usage.budgetTokens;
       if (record.createdAt != null) {
         out.first = out.first == null ? record.createdAt : Math.min(out.first, record.createdAt);
@@ -390,12 +421,30 @@ function aggregate(ledger, sessionIDs) {
       }
       if (record.model)
         out.models.add(record.model);
+      cached.totals.set(record.sessionID, out);
     }
+  }
+  const out = emptyTotals();
+  for (const id of new Set(sessionIDs)) {
+    const item = cached.totals.get(id);
+    if (!item)
+      continue;
+    for (const key of ["cost", "input", "output", "reasoning", "cacheRead", "cacheWrite", "totalTokens", "turns"])
+      out[key] += item[key];
+    out.costAvailable &&= item.costAvailable;
+    out.tokensComplete &&= item.tokensComplete;
+    if (item.first != null)
+      out.first = out.first == null ? item.first : Math.min(out.first, item.first);
+    if (item.last != null)
+      out.last = out.last == null ? item.last : Math.max(out.last, item.last);
+    for (const model of item.models)
+      out.models.add(model);
+  }
   out.costKnownLowerBound = out.cost;
   return out;
 }
 function descendants(ledger, root) {
-  const value = normalizeLedger(ledger), result = [], seen = new Set, stack = [root];
+  const value = view(ledger).ledger, result = [], seen = new Set, stack = [root];
   while (stack.length) {
     const id = stack.pop();
     if (seen.has(id))
@@ -408,11 +457,11 @@ function descendants(ledger, root) {
   }
   return result;
 }
-function canonicalRoot(ledger, id) {
-  return canonicalAncestry(ledger, id);
+function canonicalRoot(ledger, id, expectedProjectKey) {
+  return canonicalAncestry(ledger, id, expectedProjectKey);
 }
 function canonicalAncestry(ledger, id, expectedProjectKey) {
-  const value = normalizeLedger(ledger), seen = new Set;
+  const value = view(ledger).ledger, seen = new Set;
   let current = id, depth = 0, project = null;
   while (true) {
     if (seen.has(current))
@@ -504,9 +553,25 @@ function effectiveBudgetLimits(config, { agent, sessionID, rootID, approvals = [
     runTokenLimit: !Number.isFinite(config.runTokenLimit) ? null : config.runTokenLimit + runExtensionTokens
   };
 }
-function formatSubagentCheckpoint({ id, title, totalTokens, input, output, reasoning, limit, approvalTokens }) {
+function formatSubagentCheckpoint({ id, title, totalTokens, input, output, reasoning, limit, approvalTokens, rootID, blockers, canExtend = true }) {
   const marker = `<!-- cost-guard-checkpoint:${id} -->`;
   const safeTitle = typeof title === "string" ? ` (${title.replace(/[<>]/g, "").slice(0, 80)})` : "";
+  if (blockers) {
+    const facts = blockers.map(({ scope, dimension, usage, limit }) => `${scope} ${dimension}: ${usage}/${limit}`).join("; ");
+    if (!canExtend)
+      return `${marker}
+Budget checkpoint: ${id}${safeTitle}; root ${rootID || "unverified"}; ${facts}. Stop and preserve pending work; onBlock=stop exposes no extension tool. Return this blocker to the primary agent.`;
+    const commands = ["session", "run"].flatMap((scope) => {
+      const group = blockers.filter((item) => item.scope === scope);
+      if (!group.length)
+        return [];
+      const amounts = group.map(({ dimension, increment }) => `${dimension}:${increment}`).join(", ");
+      const target = scope === "session" ? `sessionID:${JSON.stringify(id)}` : 'scope:"run"';
+      return [`cost_guard_extend({${amounts}, ${target}})`];
+    }).join(" then ");
+    return `${marker}
+Budget checkpoint: ${id}${safeTitle}; root ${rootID || "unverified"}; ${facts}. Lifetime tokens ${totalTokens}: input ${input} + output ${output} + reasoning ${reasoning} (cache excluded). Ask the user: (1) Evaluate stuck first from existing progress/failure evidence; recommend Continue or Stop; (2) Continue only after approval; proposed increments ${commands}: request the exact native question, ask it, then retry unchanged only after Approve; or (3) Stop. Evaluation does not approve or unlock. Get final user approval before any extension or restart. Helpers return this blocker; only the verified root can extend. Run scope targets the root itself. Recheck all blockers before resuming the same task; fresh helpers do not bypass run caps.`;
+  }
   return `${marker}
 Subagent checkpoint: ${id}${safeTitle}; ${totalTokens}/${limit} lifetime tokens; input ${input} + output ${output} + reasoning ${reasoning} (cache excluded). Ask the user: (1) Evaluate stuck first: inspect available task results, prior errors, repeated failed checks, and evidence of no progress; state only supported findings and recommend Continue, Stop, or a distinct fresh attempt; (2) Continue only after approval, using cost_guard_extend({tokens:${approvalTokens}, sessionID:"${id}"}); or (3) Stop. Evaluation does not approve or unlock. Get final user approval before any extension or restart. A fresh attempt has a new session, not erased usage or bypassed run caps; token extension may leave USD/run blockers active.`;
 }
@@ -572,7 +637,10 @@ async function createStore({ directory, filename, projectDirectory = process.cwd
   const legacyFile = path.join(base, `${project}-${filename}`);
   if (persist)
     await ensureDirectory(journalDir);
-  const read = async () => {
+  let cached = freeze(newLedger()), seen = new Map, bytes = 0, legacySignature = null;
+  let reading = Promise.resolve();
+  const stats = { eventReads: 0, fullReplays: 0 };
+  const readOnce = async () => {
     if (!persist)
       return newLedger();
     const names = await fs.readdir(journalDir).catch((error) => {
@@ -583,22 +651,34 @@ async function createStore({ directory, filename, projectDirectory = process.cwd
     const events = names.filter((name) => name.endsWith(".event")).sort();
     if (events.length > MAX_JOURNAL_RECORDS)
       throw new Error(`accounting journal exceeds ${MAX_JOURNAL_RECORDS} events; usage is incomplete`);
-    let bytes = 0;
-    const ledgers = [];
+    const present = new Set(events);
+    for (const name of seen.keys())
+      if (!present.has(name))
+        throw new Error("accounting journal event disappeared; usage is incomplete");
+    let signature = "absent", legacy = null;
     try {
-      const legacyStat = await fs.stat(legacyFile);
-      if (legacyStat.size > MAX_STATE_BYTES)
+      const stat = await fs.stat(legacyFile);
+      if (stat.size > MAX_STATE_BYTES)
         throw new Error("legacy accounting snapshot exceeds 8 MiB");
-      ledgers.push(normalizeLedger(JSON.parse(await fs.readFile(legacyFile, "utf8"))));
+      signature = `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.ino}`;
+      if (signature !== legacySignature)
+        legacy = normalizeLedger(JSON.parse(await fs.readFile(legacyFile, "utf8")));
     } catch (error) {
       if (error.code !== "ENOENT")
         throw new Error(`cannot import legacy snapshot ${legacyFile}: ${error.message}`, { cause: error });
     }
+    const reset = signature !== legacySignature;
+    const additions = [], sizes = new Map;
+    let nextBytes = reset ? 0 : bytes;
     for (const name of events) {
+      if (!reset && seen.has(name))
+        continue;
       const file = path.join(journalDir, name), stat = await fs.stat(file);
-      bytes += stat.size;
-      if (bytes > MAX_JOURNAL_BYTES)
+      nextBytes += stat.size;
+      if (nextBytes > MAX_JOURNAL_BYTES)
         throw new Error(`accounting journal exceeds ${MAX_JOURNAL_BYTES} bytes; usage is incomplete`);
+      if (stat.size > MAX_STATE_BYTES)
+        throw new Error("accounting journal event exceeds 8 MiB");
       let event;
       try {
         event = JSON.parse(await fs.readFile(file, "utf8"));
@@ -607,14 +687,31 @@ async function createStore({ directory, filename, projectDirectory = process.cwd
       }
       if (event.version !== JOURNAL_VERSION || !event.payload || typeof event.eventID !== "string")
         throw new Error(`invalid journal event schema: ${name}`);
-      ledgers.push(event.payload);
+      stats.eventReads++;
+      additions.push(event.payload);
+      sizes.set(name, stat.size);
     }
-    return mergeLedger(...ledgers);
+    if (reset || additions.length)
+      cached = freeze(mergeLedger(reset ? legacy : cached, ...additions));
+    if (reset) {
+      seen = new Map;
+      stats.fullReplays++;
+    }
+    for (const [name, size] of sizes)
+      seen.set(name, size);
+    bytes = nextBytes;
+    legacySignature = signature;
+    return cached;
+  };
+  const read = () => {
+    reading = reading.catch(() => {}).then(readOnce);
+    return reading;
   };
   return {
     file: journalDir,
     load: read,
     replaceFromDisk: read,
+    stats: () => ({ ...stats }),
     async append(event) {
       if (!persist)
         return;
@@ -759,7 +856,7 @@ function createTracker(options, client, clock = () => Date.now(), projectDirecto
   const ingestSession = async (info) => {
     if (!info || !info.id)
       return;
-    if (info.title)
+    if (typeof info.title === "string")
       titles.set(info.id, info.title);
     const localProjectKey = await projectIdentity;
     const metadataVerified = typeof info.directory === "string" && await projectKey(info.directory).then((key) => key === localProjectKey).catch(() => false);
@@ -769,6 +866,26 @@ function createTracker(options, client, clock = () => Date.now(), projectDirecto
       metadataVerified,
       projectKey: metadataVerified ? localProjectKey : null
     }));
+  };
+  const refreshTransientMetadata = async (ids) => {
+    if (typeof client?.session?.get !== "function") {
+      for (const id of ids)
+        titles.delete(id);
+      return;
+    }
+    const expected = await projectIdentity;
+    for (const id of ids) {
+      titles.delete(id);
+      try {
+        const response = await client.session.get({ path: { id } });
+        const info = response?.data;
+        if (!info || response.error || info.id !== id || typeof info.directory !== "string" || typeof info.projectID !== "string" || await projectKey(info.directory).catch(() => null) !== expected)
+          continue;
+        titles.delete(id);
+        if (typeof info.title === "string")
+          titles.set(id, info.title);
+      } catch {}
+    }
   };
   const sdkSessionIDs = new Set;
   const verifySessionFromSdk = async (id, expectedProject = projectDirectory) => {
@@ -876,6 +993,21 @@ function createTracker(options, client, clock = () => Date.now(), projectDirecto
       model: [...value.models].join(", ") || null
     };
   };
+  const shortIDs = (ids) => {
+    const result = new Map;
+    for (const id of ids) {
+      let length = Math.min(8, id.length);
+      while (ids.some((other) => other !== id && other.slice(0, length) === id.slice(0, length)) && length < id.length)
+        length++;
+      result.set(id, id.slice(0, length));
+    }
+    return result;
+  };
+  const projectInstances = (ids, ancestry) => {
+    const present = ids.filter((id) => aggregate(ledger, [id]).turns > 0).sort();
+    const short = shortIDs(present);
+    return present.map((id) => instanceFor(id, short.get(id), ancestry));
+  };
   const hydrateRows = () => {
     for (const [id, state] of sessions) {
       state.messages.clear();
@@ -893,7 +1025,38 @@ function createTracker(options, client, clock = () => Date.now(), projectDirecto
           });
     }
   };
-  const rowFor = (id) => ({ agent: agentOf(id), title: titles.get(id) || "", depth: depthOf(id), ...usageSummary(id) });
+  const rowFor = (id, shortID) => ({ id, shortID, agent: agentOf(id), title: titles.get(id) || "", depth: depthOf(id), ...usageSummary(id) });
+  const instanceFor = (id, shortID, ancestry) => {
+    const value = aggregate(ledger, [id]);
+    const session = ledger.sessions[id] || {};
+    const models = [...value.models].sort();
+    return {
+      sessionID: id,
+      shortID,
+      title: titles.get(id) || null,
+      titleAvailable: typeof titles.get(id) === "string",
+      agent: agentOf(id),
+      model: models.length ? models.join(", ") : null,
+      models,
+      cost: value.costKnownLowerBound,
+      costKnownLowerBound: value.costKnownLowerBound,
+      costAvailable: value.costAvailable,
+      input: value.input,
+      output: value.output,
+      reasoning: value.reasoning,
+      cacheRead: value.cacheRead,
+      cacheWrite: value.cacheWrite,
+      totalTokens: value.totalTokens,
+      tokensComplete: value.tokensComplete,
+      tokenCompleteness: value.tokensComplete ? "complete" : "incomplete",
+      durationMs: value.first != null && value.last != null ? Math.max(0, value.last - value.first) : 0,
+      first: value.first,
+      last: value.last,
+      depth: depthOf(id),
+      attributionComplete: Boolean(session.metadataVerified && ancestry.complete)
+    };
+  };
+  const instanceCompleteness = (instances) => instances.map((instance) => `${instance.shortID}: cost ${instance.costAvailable ? "available" : `incomplete (known >=$${instance.costKnownLowerBound.toFixed(4)})`}, tokens ${instance.tokenCompleteness}`).join("; ");
   const emit = async (sessionID) => {
     await reload();
     await recover(sessionID);
@@ -902,16 +1065,23 @@ function createTracker(options, client, clock = () => Date.now(), projectDirecto
     await reload();
     if (!ledger.sessions[sessionID]?.metadataVerified)
       return null;
+    const requestedScope = resolveReportScope(cfg, undefined, true);
     const isSubagent = ledger.sessions[sessionID]?.parentID != null;
-    if (cfg.rollup && isSubagent)
+    const ancestry = canonicalRoot(ledger, sessionID, await projectIdentity);
+    if (requestedScope === "run" && (isSubagent || !ancestry.complete || ancestry.isRoot !== true || ancestry.id !== sessionID))
       return null;
-    const ancestry = cfg.rollup ? canonicalRoot(ledger, sessionID) : { id: sessionID, complete: true };
-    const ids = cfg.rollup ? descendants(ledger, ancestry.id) : [sessionID];
+    const runIDs = descendants(ledger, ancestry.id).sort();
+    const ids = requestedScope === "run" ? runIDs : [sessionID];
+    await refreshTransientMetadata(ids);
+    await reload();
     hydrateRows();
-    const present = ids.filter((id) => aggregate(ledger, [id]).turns > 0);
+    const instances = projectInstances(ids, ancestry);
+    const present = instances.map((instance) => instance.sessionID);
+    const rowIDs = new Map(instances.map((instance) => [instance.sessionID, instance.shortID]));
     const rawTotal = aggregate(ledger, present);
-    const rootStart = ids.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
-    const elapsedStart = ids.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
+    const runTotal = aggregate(ledger, runIDs);
+    const sessionTotal = aggregate(ledger, [sessionID]);
+    const elapsedStart = runIDs.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
     const total = {
       ...rawTotal,
       cost: rawTotal.cost,
@@ -927,13 +1097,67 @@ function createTracker(options, client, clock = () => Date.now(), projectDirecto
       return null;
     if (rawTotal.costAvailable && rawTotal.cost < cfg.minCost && total.totalTokens === 0)
       return null;
-    const key = [total.turns, total.costAvailable, total.cost, total.input, total.output, total.cacheRead, total.cacheWrite, total.ms].join("|");
+    const instanceByID = new Map(instances.map((instance) => [instance.sessionID, instance]));
+    const rows = present.map((id) => ({ ...rowFor(id, rowIDs.get(id)), ...instanceByID.get(id), models: aggregate(ledger, [id]).models }));
+    const budgetProjection = await projectBudget(ancestry.id, sessionID, runTotal, sessionTotal);
+    const emittedBudget = budgetProjection.guardBudget;
+    const visibleRows = rows.map((row) => ({
+      ...row,
+      model: cfg.format === "table" ? row.model || "" : row.model,
+      title: cfg.format === "table" ? row.title || "" : row.title
+    }));
+    const visibleSnapshot = {
+      rows: visibleRows.map((row) => ({
+        id: row.id,
+        shortID: row.shortID,
+        agent: row.agent,
+        title: row.title,
+        model: [...row.models].sort().join(", ") || null,
+        input: row.input,
+        output: row.output,
+        ...cfg.includeReasoning ? { reasoning: row.reasoning } : {},
+        cacheRead: row.cacheRead,
+        cacheWrite: row.cacheWrite,
+        totalTokens: row.totalTokens,
+        cost: row.costAvailable ? row.cost : row.costKnownLowerBound,
+        costKnownLowerBound: row.costKnownLowerBound,
+        costAvailable: row.costAvailable,
+        tokensComplete: row.tokensComplete,
+        tokenCompleteness: row.tokenCompleteness,
+        ms: row.ms
+      })),
+      total: {
+        input: total.input,
+        output: total.output,
+        ...cfg.includeReasoning ? { reasoning: total.reasoning } : {},
+        cacheRead: total.cacheRead,
+        cacheWrite: total.cacheWrite,
+        totalTokens: total.totalTokens,
+        cost: rawTotal.costAvailable ? total.cost : rawTotal.costKnownLowerBound,
+        costAvailable: rawTotal.costAvailable,
+        costKnownLowerBound: rawTotal.costKnownLowerBound,
+        tokensComplete: rawTotal.tokensComplete,
+        ms: total.ms,
+        attributionComplete: total.attributionComplete
+      },
+      budget: emittedBudget,
+      format: cfg.format,
+      includeReasoning: cfg.includeReasoning,
+      maxTitle: cfg.maxTitle,
+      title: cfg.title,
+      showToast: cfg.showToast,
+      showLog: cfg.showLog,
+      toastDuration: cfg.toastDuration,
+      guardBudget: emittedBudget
+    };
+    const key = JSON.stringify(visibleSnapshot);
     const printed = get(sessionID);
     if (printed.printedKey === key)
       return null;
     printed.printedKey = key;
-    const text = `${cfg.format === "table" ? formatTable(present.map(rowFor), { includeReasoning: cfg.includeReasoning, maxTitle: cfg.maxTitle, total: { ...total, costAvailable: rawTotal.costAvailable } }) : formatLine({ ...total, costAvailable: rawTotal.costAvailable, includeReasoning: cfg.includeReasoning })}
-` + `Cost: ${rawTotal.costAvailable ? "available" : `incomplete; known subtotal $${rawTotal.costKnownLowerBound.toFixed(4)}`}; budget tokens: ${total.totalTokens}; ` + `message span: ${total.ms} ms; run elapsed: ${fmtDuration(total.elapsedMs)}; attribution: ${ancestry.complete ? "complete" : "incomplete"}` + await budgetSummary(ancestry.id, sessionID, rawTotal);
+    const text = `${cfg.format === "table" ? formatTable(rows, { includeReasoning: cfg.includeReasoning, maxTitle: cfg.maxTitle, total: { ...total, costAvailable: rawTotal.costAvailable } }) : `${formatLine({ ...total, costAvailable: rawTotal.costAvailable, includeReasoning: cfg.includeReasoning })}
+Instances: ${instances.map((instance) => `${instance.shortID} ${instance.agent} ${instance.model || "model unavailable"}${instance.title ? ` — ${instance.title}` : ""}`).join("; ")}`}
+` + `Cost: ${rawTotal.costAvailable ? "available" : `incomplete; known subtotal $${rawTotal.costKnownLowerBound.toFixed(4)}`}; tokens: ${rawTotal.tokensComplete ? "complete" : "incomplete"}; budget tokens: ${total.totalTokens}; ` + `message span: ${total.ms} ms; run elapsed: ${fmtDuration(total.elapsedMs)}; attribution: ${ancestry.complete ? "complete" : "incomplete"}; ` + `instance completeness: ${instanceCompleteness(instances)}; guard budget: ${emittedBudget.available ? "available" : `unavailable (${emittedBudget.attributionReason || "unknown"})`}; ` + `budget attribution: ${emittedBudget.attributionComplete ? "complete" : "incomplete"}` + budgetSummary(budgetProjection);
     if (cfg.showLog) {
       try {
         await client.app.log({ body: { service: "run-stats", level: "info", message: text, extra: total } });
@@ -962,13 +1186,13 @@ function createTracker(options, client, clock = () => Date.now(), projectDirecto
     const result = resolveActiveGuardConfig(source, { projectKey: await projectKey(projectDirectory), hostname: os2.hostname() });
     cfg.guardSummary = result.available ? { schema: "opencode-cost-guard-budget-v1", ...result.config, approvals: source.approvals || [] } : null;
   };
-  const budgetSummary = async (runId, reportSession, totals) => {
-    const effective = await effectiveBudget(runId, reportSession, totals);
+  const budgetSummary = (projection) => {
+    const effective = projection.guardBudget;
     if (!effective.available)
       return `
 Guard budget: unavailable`;
     return `
-Guard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}; remaining ${effective.runUsdRemaining ?? "unavailable"}; overage ${effective.runUsdOverage ?? "unavailable"}; session USD remaining ${effective.sessionUsdRemaining ?? "unavailable"}; run token remaining ${effective.runTokensRemaining ?? "unavailable"}`;
+Guard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}; remaining ${effective.runUsdRemaining ?? "unavailable"}; overage ${effective.runUsdOverage ?? "unavailable"}; session USD remaining ${projection.sessionBudget.sessionUsdRemaining ?? "unavailable"}; run token remaining ${effective.runTokensRemaining ?? "unavailable"}`;
   };
   const effectiveBudget = async (runId, sessionID, totals, sessionTotals = aggregate(ledger, [sessionID])) => {
     const guard = cfg.guardSummary;
@@ -1008,6 +1232,7 @@ Guard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}
       runUsdLimit: effective.runUsdLimit,
       attributionComplete: effective.ancestryComplete,
       attributionReason: effective.ancestryReason,
+      totalTokens: totals.totalTokens,
       subagentApplicable: effective.subagentApplicable,
       subagentBaseLimit: effective.subagentBaseLimit,
       subagentEffectiveLimit: effective.subagentEffectiveLimit,
@@ -1032,6 +1257,32 @@ Guard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}
       sessionBudgetAvailable: sessionUsdLimit != null || sessionTokenLimit != null,
       runBudgetAvailable: runUsdLimit != null || runTokenLimit != null
     };
+  };
+  const projectBudget = async (runID, sessionID, runTotals, sessionTotals = aggregate(ledger, [sessionID])) => {
+    const guardBudget = await effectiveBudget(runID, sessionID, runTotals, sessionTotals);
+    return { guardBudget, sessionBudget: {
+      available: guardBudget.available,
+      attributionComplete: guardBudget.attributionComplete,
+      attributionReason: guardBudget.attributionReason,
+      subagentApplicable: guardBudget.subagentApplicable,
+      subagentBaseLimit: guardBudget.subagentBaseLimit,
+      subagentEffectiveLimit: guardBudget.subagentEffectiveLimit,
+      subagentCapAvailable: guardBudget.subagentCapAvailable,
+      activeTokenDimensions: guardBudget.activeTokenDimensions,
+      legacyTokenLimit: guardBudget.legacyTokenLimit,
+      effectiveSessionTokenLimit: guardBudget.effectiveSessionTokenLimit,
+      appliesToSession: guardBudget.appliesToSession,
+      excludedFromSessionBudget: guardBudget.excludedFromSessionBudget,
+      extensions: guardBudget.extensions,
+      costAvailable: sessionTotals.costAvailable,
+      knownCostLowerBound: sessionTotals.costKnownLowerBound,
+      sessionUsdLimit: guardBudget.sessionUsdLimit,
+      sessionUsdRemaining: guardBudget.sessionUsdRemaining,
+      sessionUsdOverage: guardBudget.sessionUsdOverage,
+      sessionTokenLimit: guardBudget.sessionTokenLimit,
+      sessionTokensRemaining: guardBudget.sessionTokensRemaining,
+      sessionBudgetAvailable: guardBudget.sessionBudgetAvailable
+    } };
   };
   const recover = async (sessionID) => {
     if (historyCoverage.has(sessionID))
@@ -1112,9 +1363,10 @@ Guard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}
     return notices;
   };
   const checkpointNotice = async (callerSessionID, maxDescendants = 8) => appendSubagentCheckpoints("", await checkpointEntries(callerSessionID), { limit: maxDescendants });
-  const report = async (sessionID, scope = "run", selectedSession) => {
+  const report = async (sessionID, scope, selectedSession) => {
     await reload();
     await refreshGuardConfig();
+    scope = resolveReportScope(cfg, scope);
     const reportSession = selectedSession || sessionID;
     await recover(reportSession);
     await mutationQueue;
@@ -1122,32 +1374,13 @@ Guard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}
     const root = canonicalAncestry(ledger, reportSession, await projectIdentity);
     const sessionIDs = [reportSession], runIDs = descendants(ledger, root.id);
     const ids = scope === "session" ? sessionIDs : runIDs;
+    await refreshTransientMetadata(new Set([...ids, reportSession]));
+    await reload();
     const raw = aggregate(ledger, ids), runTotals = aggregate(ledger, runIDs), sessionTotals = aggregate(ledger, sessionIDs);
     const runStart = runIDs.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
-    const runBudget = await effectiveBudget(root.id, reportSession, runTotals, sessionTotals);
-    const sessionBudget = {
-      available: runBudget.available,
-      attributionComplete: runBudget.attributionComplete,
-      attributionReason: runBudget.attributionReason,
-      subagentApplicable: runBudget.subagentApplicable,
-      subagentBaseLimit: runBudget.subagentBaseLimit,
-      subagentEffectiveLimit: runBudget.subagentEffectiveLimit,
-      subagentCapAvailable: runBudget.subagentCapAvailable,
-      activeTokenDimensions: runBudget.activeTokenDimensions,
-      legacyTokenLimit: runBudget.legacyTokenLimit,
-      effectiveSessionTokenLimit: runBudget.effectiveSessionTokenLimit,
-      appliesToSession: runBudget.appliesToSession,
-      excludedFromSessionBudget: runBudget.excludedFromSessionBudget,
-      extensions: runBudget.extensions,
-      costAvailable: sessionTotals.costAvailable,
-      knownCostLowerBound: sessionTotals.costKnownLowerBound,
-      sessionUsdLimit: runBudget.sessionUsdLimit,
-      sessionUsdRemaining: runBudget.sessionUsdRemaining,
-      sessionUsdOverage: runBudget.sessionUsdOverage,
-      sessionTokenLimit: runBudget.sessionTokenLimit,
-      sessionTokensRemaining: runBudget.sessionTokensRemaining,
-      sessionBudgetAvailable: runBudget.sessionBudgetAvailable
-    };
+    const budgetProjection = await projectBudget(root.id, reportSession, runTotals, sessionTotals);
+    const { guardBudget: runBudget, sessionBudget } = budgetProjection;
+    const instances = projectInstances(ids, root);
     return {
       scope,
       sessionID: reportSession,
@@ -1161,8 +1394,10 @@ Guard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}
       messageSpanMs: raw.first != null && raw.last != null ? raw.last - raw.first : 0,
       runElapsedMs: Number.isFinite(runStart) ? Math.max(0, clock() - runStart) : 0,
       historyCoverage: historyCoverage.get(sessionID) || "unavailable",
+      instances,
       guardBudget: runBudget,
-      guardSessionBudget: sessionBudget
+      guardSessionBudget: sessionBudget,
+      runCostKnownLowerBound: runTotals.costKnownLowerBound
     };
   };
   const refresh = async () => {
@@ -1684,7 +1919,7 @@ var RunStats = async ({ client, directory }, options) => {
           await tracker.refresh();
           await tracker.refreshGuardConfig();
           const reportSession = requested || context.sessionID;
-          const result = await tracker.report(reportSession, args?.scope || "run");
+          const result = await tracker.report(reportSession, resolveReportScope(mergedOptions, args?.scope));
           return JSON.stringify(result, null, 2);
         }
       }

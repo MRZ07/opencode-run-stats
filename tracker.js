@@ -6,7 +6,7 @@
  * summing the whole session tree (parent + spawned subagents) into a table
  * labelled by agent (message mode) and session title.
  */
-import { formatLine, formatTable, fmtDuration, normalizeOptions } from "./lib.js";
+import { formatLine, formatTable, fmtDuration, normalizeOptions, resolveReportScope } from "./lib.js";
 import os from "node:os";
 import { aggregate, canonicalRoot, canonicalAncestry, createStore, descendants, newLedger, recordMessage, recordSession, tombstoneSession, mergeLedger, deltaLedger, hasChanges, resolveActiveGuardConfig, projectKey, effectiveBudgetLimits, readStore, appendSubagentCheckpoints } from "./accounting.js";
 
@@ -63,12 +63,27 @@ export function createTracker(options, client, clock = () => Date.now(), project
 
   const ingestSession = async (info) => {
     if (!info || !info.id) return;
-    if (info.title) titles.set(info.id, info.title);
+    if (typeof info.title === "string") titles.set(info.id, info.title);
     const localProjectKey = await projectIdentity;
     const metadataVerified = typeof info.directory === "string" &&
       await projectKey(info.directory).then((key) => key === localProjectKey).catch(() => false);
     await enqueue((current) => recordSession(current, info, { writerID: `stats:${process.pid}`, writerSeq: ++writerSeq,
       metadataVerified, projectKey: metadataVerified ? localProjectKey : null }));
+  };
+  const refreshTransientMetadata = async (ids) => {
+    if (typeof client?.session?.get !== "function") { for (const id of ids) titles.delete(id); return; }
+    const expected = await projectIdentity;
+    for (const id of ids) {
+      titles.delete(id);
+      try {
+        const response = await client.session.get({ path: { id } });
+        const info = response?.data;
+        if (!info || response.error || info.id !== id || typeof info.directory !== "string" || typeof info.projectID !== "string" ||
+          await projectKey(info.directory).catch(() => null) !== expected) continue;
+        titles.delete(id);
+        if (typeof info.title === "string") titles.set(id, info.title);
+      } catch { /* SDK metadata is optional; IDs remain the safe fallback. */ }
+    }
   };
   const sdkSessionIDs = new Set();
   const verifySessionFromSdk = async (id, expectedProject = projectDirectory) => {
@@ -148,6 +163,22 @@ export function createTracker(options, client, clock = () => Date.now(), project
       model: [...value.models].join(", ") || null };
   };
 
+  const shortIDs = (ids) => {
+    const result = new Map();
+    for (const id of ids) {
+      let length = Math.min(8, id.length);
+      while (ids.some((other) => other !== id && other.slice(0, length) === id.slice(0, length)) && length < id.length) length++;
+      result.set(id, id.slice(0, length));
+    }
+    return result;
+  };
+
+  const projectInstances = (ids, ancestry) => {
+    const present = ids.filter((id) => aggregate(ledger, [id]).turns > 0).sort();
+    const short = shortIDs(present);
+    return present.map((id) => instanceFor(id, short.get(id), ancestry));
+  };
+
   const hydrateRows = () => {
     for (const [id, state] of sessions) {
       state.messages.clear();
@@ -157,7 +188,24 @@ export function createTracker(options, client, clock = () => Date.now(), project
       });
     }
   };
-  const rowFor = (id) => ({ agent: agentOf(id), title: titles.get(id) || "", depth: depthOf(id), ...usageSummary(id) });
+  const rowFor = (id, shortID) => ({ id, shortID, agent: agentOf(id), title: titles.get(id) || "", depth: depthOf(id), ...usageSummary(id) });
+  const instanceFor = (id, shortID, ancestry) => {
+    const value = aggregate(ledger, [id]);
+    const session = ledger.sessions[id] || {};
+    const models = [...value.models].sort();
+    return { sessionID: id, shortID, title: titles.get(id) || null, titleAvailable: typeof titles.get(id) === "string",
+      agent: agentOf(id), model: models.length ? models.join(", ") : null, models,
+      cost: value.costKnownLowerBound, costKnownLowerBound: value.costKnownLowerBound, costAvailable: value.costAvailable,
+      input: value.input, output: value.output, reasoning: value.reasoning, cacheRead: value.cacheRead, cacheWrite: value.cacheWrite,
+      totalTokens: value.totalTokens, tokensComplete: value.tokensComplete,
+      tokenCompleteness: value.tokensComplete ? "complete" : "incomplete",
+      durationMs: value.first != null && value.last != null ? Math.max(0, value.last - value.first) : 0,
+      first: value.first, last: value.last, depth: depthOf(id),
+      attributionComplete: Boolean(session.metadataVerified && ancestry.complete) };
+  };
+  const instanceCompleteness = (instances) => instances.map((instance) =>
+    `${instance.shortID}: cost ${instance.costAvailable ? "available" : `incomplete (known >=$${instance.costKnownLowerBound.toFixed(4)})`}, tokens ${instance.tokenCompleteness}`)
+    .join("; ");
 
   const emit = async (sessionID) => {
     await reload();
@@ -166,16 +214,22 @@ export function createTracker(options, client, clock = () => Date.now(), project
     await refreshGuardConfig();
     await reload();
     if (!ledger.sessions[sessionID]?.metadataVerified) return null;
+    const requestedScope = resolveReportScope(cfg, undefined, true);
     const isSubagent = ledger.sessions[sessionID]?.parentID != null;
-    if (cfg.rollup && isSubagent) return null;
-
-      const ancestry = cfg.rollup ? canonicalRoot(ledger, sessionID) : { id: sessionID, complete: true };
-    const ids = cfg.rollup ? descendants(ledger, ancestry.id) : [sessionID];
+    const ancestry = canonicalRoot(ledger, sessionID, await projectIdentity);
+    if (requestedScope === "run" && (isSubagent || !ancestry.complete || ancestry.isRoot !== true || ancestry.id !== sessionID)) return null;
+    const runIDs = descendants(ledger, ancestry.id).sort();
+    const ids = requestedScope === "run" ? runIDs : [sessionID];
+    await refreshTransientMetadata(ids);
+    await reload();
     hydrateRows();
-    const present = ids.filter((id) => aggregate(ledger, [id]).turns > 0);
+    const instances = projectInstances(ids, ancestry);
+    const present = instances.map((instance) => instance.sessionID);
+    const rowIDs = new Map(instances.map((instance) => [instance.sessionID, instance.shortID]));
     const rawTotal = aggregate(ledger, present);
-    const rootStart = ids.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
-    const elapsedStart = ids.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
+    const runTotal = aggregate(ledger, runIDs);
+    const sessionTotal = aggregate(ledger, [sessionID]);
+    const elapsedStart = runIDs.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
     const total = { ...rawTotal, cost: rawTotal.cost, ms: rawTotal.first != null && rawTotal.last != null ? Math.max(0, rawTotal.last - rawTotal.first) : 0,
       model: [...rawTotal.models].join(", ") || null, turns: rawTotal.turns, elapsedMs: Number.isFinite(elapsedStart) ? Math.max(0, clock() - elapsedStart) : 0,
       attributionComplete: ancestry.complete };
@@ -184,18 +238,44 @@ export function createTracker(options, client, clock = () => Date.now(), project
     if (rawTotal.costAvailable && total.cost === 0 && total.input === 0 && total.output === 0) return null;
     if (rawTotal.costAvailable && rawTotal.cost < cfg.minCost && total.totalTokens === 0) return null;
 
-    const key = [total.turns, total.costAvailable, total.cost, total.input, total.output, total.cacheRead, total.cacheWrite, total.ms].join("|");
+    const instanceByID = new Map(instances.map((instance) => [instance.sessionID, instance]));
+    const rows = present.map((id) => ({ ...rowFor(id, rowIDs.get(id)), ...instanceByID.get(id), models: aggregate(ledger, [id]).models }));
+    const budgetProjection = await projectBudget(ancestry.id, sessionID, runTotal, sessionTotal);
+    const emittedBudget = budgetProjection.guardBudget;
+    const visibleRows = rows.map((row) => ({ ...row,
+      model: cfg.format === "table" ? (row.model || "") : row.model,
+      title: cfg.format === "table" ? (row.title || "") : row.title }));
+    const visibleSnapshot = {
+      rows: visibleRows.map((row) => ({ id: row.id, shortID: row.shortID, agent: row.agent, title: row.title,
+        model: [...row.models].sort().join(", ") || null, input: row.input, output: row.output,
+        ...(cfg.includeReasoning ? { reasoning: row.reasoning } : {}), cacheRead: row.cacheRead, cacheWrite: row.cacheWrite,
+        totalTokens: row.totalTokens, cost: row.costAvailable ? row.cost : row.costKnownLowerBound,
+        costKnownLowerBound: row.costKnownLowerBound, costAvailable: row.costAvailable,
+        tokensComplete: row.tokensComplete, tokenCompleteness: row.tokenCompleteness, ms: row.ms })),
+      total: { input: total.input, output: total.output, ...(cfg.includeReasoning ? { reasoning: total.reasoning } : {}),
+        cacheRead: total.cacheRead, cacheWrite: total.cacheWrite, totalTokens: total.totalTokens,
+        cost: rawTotal.costAvailable ? total.cost : rawTotal.costKnownLowerBound, costAvailable: rawTotal.costAvailable,
+        costKnownLowerBound: rawTotal.costKnownLowerBound, tokensComplete: rawTotal.tokensComplete,
+        ms: total.ms, attributionComplete: total.attributionComplete },
+      budget: emittedBudget,
+      format: cfg.format, includeReasoning: cfg.includeReasoning, maxTitle: cfg.maxTitle, title: cfg.title,
+      showToast: cfg.showToast, showLog: cfg.showLog, toastDuration: cfg.toastDuration,
+      guardBudget: emittedBudget };
+    const key = JSON.stringify(visibleSnapshot);
     const printed = get(sessionID);
     if (printed.printedKey === key) return null;
     printed.printedKey = key;
 
     const text =
       `${cfg.format === "table"
-        ? formatTable(present.map(rowFor), { includeReasoning: cfg.includeReasoning, maxTitle: cfg.maxTitle, total: { ...total, costAvailable: rawTotal.costAvailable } })
-        : formatLine({ ...total, costAvailable: rawTotal.costAvailable, includeReasoning: cfg.includeReasoning })}\n` +
-      `Cost: ${rawTotal.costAvailable ? "available" : `incomplete; known subtotal $${rawTotal.costKnownLowerBound.toFixed(4)}`}; budget tokens: ${total.totalTokens}; ` +
-      `message span: ${total.ms} ms; run elapsed: ${fmtDuration(total.elapsedMs)}; attribution: ${ancestry.complete ? "complete" : "incomplete"}`
-      + await budgetSummary(ancestry.id, sessionID, rawTotal);
+        ? formatTable(rows, { includeReasoning: cfg.includeReasoning, maxTitle: cfg.maxTitle, total: { ...total, costAvailable: rawTotal.costAvailable } })
+        : `${formatLine({ ...total, costAvailable: rawTotal.costAvailable, includeReasoning: cfg.includeReasoning })}\nInstances: ${instances.map((instance) =>
+          `${instance.shortID} ${instance.agent} ${instance.model || "model unavailable"}${instance.title ? ` — ${instance.title}` : ""}`).join("; ")}`}\n` +
+      `Cost: ${rawTotal.costAvailable ? "available" : `incomplete; known subtotal $${rawTotal.costKnownLowerBound.toFixed(4)}`}; tokens: ${rawTotal.tokensComplete ? "complete" : "incomplete"}; budget tokens: ${total.totalTokens}; ` +
+      `message span: ${total.ms} ms; run elapsed: ${fmtDuration(total.elapsedMs)}; attribution: ${ancestry.complete ? "complete" : "incomplete"}; ` +
+      `instance completeness: ${instanceCompleteness(instances)}; guard budget: ${emittedBudget.available ? "available" : `unavailable (${emittedBudget.attributionReason || "unknown"})`}; ` +
+      `budget attribution: ${emittedBudget.attributionComplete ? "complete" : "incomplete"}`
+      + budgetSummary(budgetProjection);
 
     if (cfg.showLog) {
       try {
@@ -226,10 +306,10 @@ export function createTracker(options, client, clock = () => Date.now(), project
     cfg.guardSummary = result.available ? { schema: "opencode-cost-guard-budget-v1", ...result.config, approvals: source.approvals || [] } : null;
   };
 
-  const budgetSummary = async (runId, reportSession, totals) => {
-    const effective = await effectiveBudget(runId, reportSession, totals);
+  const budgetSummary = (projection) => {
+    const effective = projection.guardBudget;
     if (!effective.available) return "\nGuard budget: unavailable";
-    return `\nGuard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}; remaining ${effective.runUsdRemaining ?? "unavailable"}; overage ${effective.runUsdOverage ?? "unavailable"}; session USD remaining ${effective.sessionUsdRemaining ?? "unavailable"}; run token remaining ${effective.runTokensRemaining ?? "unavailable"}`;
+    return `\nGuard budget: available; run USD limit ${effective.runUsdLimit ?? "unavailable"}; remaining ${effective.runUsdRemaining ?? "unavailable"}; overage ${effective.runUsdOverage ?? "unavailable"}; session USD remaining ${projection.sessionBudget.sessionUsdRemaining ?? "unavailable"}; run token remaining ${effective.runTokensRemaining ?? "unavailable"}`;
   };
 
   const effectiveBudget = async (runId, sessionID, totals, sessionTotals = aggregate(ledger, [sessionID])) => {
@@ -250,6 +330,7 @@ export function createTracker(options, client, clock = () => Date.now(), project
         runUsd: effective.runExtensionUsd, runTokens: effective.runExtensionTokens },
       costAvailable: totals.costAvailable, knownCostLowerBound: totals.costKnownLowerBound, runUsdLimit: effective.runUsdLimit,
       attributionComplete: effective.ancestryComplete, attributionReason: effective.ancestryReason,
+      totalTokens: totals.totalTokens,
       subagentApplicable: effective.subagentApplicable, subagentBaseLimit: effective.subagentBaseLimit,
       subagentEffectiveLimit: effective.subagentEffectiveLimit, subagentCapAvailable: effective.subagentBaseLimit != null,
       activeTokenDimensions: { legacySession: effective.legacyTokenLimit, subagent: effective.subagentBaseLimit,
@@ -263,6 +344,32 @@ export function createTracker(options, client, clock = () => Date.now(), project
       runTokenLimit, runTokensRemaining: runTokenLimit == null ? null : Math.max(0, runTokenLimit - totals.totalTokens),
       sessionBudgetAvailable: sessionUsdLimit != null || sessionTokenLimit != null,
       runBudgetAvailable: runUsdLimit != null || runTokenLimit != null };
+  };
+  const projectBudget = async (runID, sessionID, runTotals, sessionTotals = aggregate(ledger, [sessionID])) => {
+    const guardBudget = await effectiveBudget(runID, sessionID, runTotals, sessionTotals);
+    return { guardBudget, sessionBudget: {
+      available: guardBudget.available,
+      attributionComplete: guardBudget.attributionComplete,
+      attributionReason: guardBudget.attributionReason,
+      subagentApplicable: guardBudget.subagentApplicable,
+      subagentBaseLimit: guardBudget.subagentBaseLimit,
+      subagentEffectiveLimit: guardBudget.subagentEffectiveLimit,
+      subagentCapAvailable: guardBudget.subagentCapAvailable,
+      activeTokenDimensions: guardBudget.activeTokenDimensions,
+      legacyTokenLimit: guardBudget.legacyTokenLimit,
+      effectiveSessionTokenLimit: guardBudget.effectiveSessionTokenLimit,
+      appliesToSession: guardBudget.appliesToSession,
+      excludedFromSessionBudget: guardBudget.excludedFromSessionBudget,
+      extensions: guardBudget.extensions,
+      costAvailable: sessionTotals.costAvailable,
+      knownCostLowerBound: sessionTotals.costKnownLowerBound,
+      sessionUsdLimit: guardBudget.sessionUsdLimit,
+      sessionUsdRemaining: guardBudget.sessionUsdRemaining,
+      sessionUsdOverage: guardBudget.sessionUsdOverage,
+      sessionTokenLimit: guardBudget.sessionTokenLimit,
+      sessionTokensRemaining: guardBudget.sessionTokensRemaining,
+      sessionBudgetAvailable: guardBudget.sessionBudgetAvailable,
+    } };
   };
   const recover = async (sessionID) => {
     if (historyCoverage.has(sessionID)) return;
@@ -314,8 +421,9 @@ export function createTracker(options, client, clock = () => Date.now(), project
   const checkpointNotice = async (callerSessionID, maxDescendants = 8) =>
     appendSubagentCheckpoints("", await checkpointEntries(callerSessionID), { limit: maxDescendants });
 
-  const report = async (sessionID, scope = "run", selectedSession) => {
+  const report = async (sessionID, scope, selectedSession) => {
     await reload(); await refreshGuardConfig();
+    scope = resolveReportScope(cfg, scope);
     const reportSession = selectedSession || sessionID;
     await recover(reportSession);
     await mutationQueue;
@@ -323,39 +431,21 @@ export function createTracker(options, client, clock = () => Date.now(), project
     const root = canonicalAncestry(ledger, reportSession, await projectIdentity);
     const sessionIDs = [reportSession], runIDs = descendants(ledger, root.id);
     const ids = scope === "session" ? sessionIDs : runIDs;
+    await refreshTransientMetadata(new Set([...ids, reportSession]));
+    await reload();
     const raw = aggregate(ledger, ids), runTotals = aggregate(ledger, runIDs), sessionTotals = aggregate(ledger, sessionIDs);
     const runStart = runIDs.map((id) => ledger.sessions[id]?.startAt ?? aggregate(ledger, [id]).first).filter(Number.isFinite).reduce((minimum, value) => Math.min(minimum, value), Infinity);
-    const runBudget = await effectiveBudget(root.id, reportSession, runTotals, sessionTotals);
-    const sessionBudget = {
-      available: runBudget.available,
-      attributionComplete: runBudget.attributionComplete,
-      attributionReason: runBudget.attributionReason,
-      subagentApplicable: runBudget.subagentApplicable,
-      subagentBaseLimit: runBudget.subagentBaseLimit,
-      subagentEffectiveLimit: runBudget.subagentEffectiveLimit,
-      subagentCapAvailable: runBudget.subagentCapAvailable,
-      activeTokenDimensions: runBudget.activeTokenDimensions,
-      legacyTokenLimit: runBudget.legacyTokenLimit,
-      effectiveSessionTokenLimit: runBudget.effectiveSessionTokenLimit,
-      appliesToSession: runBudget.appliesToSession,
-      excludedFromSessionBudget: runBudget.excludedFromSessionBudget,
-      extensions: runBudget.extensions,
-      costAvailable: sessionTotals.costAvailable,
-      knownCostLowerBound: sessionTotals.costKnownLowerBound,
-      sessionUsdLimit: runBudget.sessionUsdLimit,
-      sessionUsdRemaining: runBudget.sessionUsdRemaining,
-      sessionUsdOverage: runBudget.sessionUsdOverage,
-      sessionTokenLimit: runBudget.sessionTokenLimit,
-      sessionTokensRemaining: runBudget.sessionTokensRemaining,
-      sessionBudgetAvailable: runBudget.sessionBudgetAvailable,
-    };
+    const budgetProjection = await projectBudget(root.id, reportSession, runTotals, sessionTotals);
+    const { guardBudget: runBudget, sessionBudget } = budgetProjection;
+    const instances = projectInstances(ids, root);
     return { scope, sessionID: reportSession, runID: root.id, attributionComplete: root.complete,
       subagentAttributionComplete: runBudget.attributionComplete ?? false,
       subagentAttributionReason: runBudget.attributionReason ?? "unknown",
       cost: raw.cost, costAvailable: raw.costAvailable, ...raw, messageSpanMs: raw.first != null && raw.last != null ? raw.last - raw.first : 0,
       runElapsedMs: Number.isFinite(runStart) ? Math.max(0, clock() - runStart) : 0,
-       historyCoverage: historyCoverage.get(sessionID) || "unavailable",
-       guardBudget: runBudget, guardSessionBudget: sessionBudget };
+       historyCoverage: historyCoverage.get(sessionID) || "unavailable", instances,
+        guardBudget: runBudget, guardSessionBudget: sessionBudget,
+        runCostKnownLowerBound: runTotals.costKnownLowerBound };
   };
 
   const refresh = async () => {

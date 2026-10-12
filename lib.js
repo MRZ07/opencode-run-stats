@@ -122,12 +122,19 @@ export function normalizeOptions(options = {}) {
     rollup: options.rollup !== false,
     format: options.format === "line" ? "line" : "table",
     maxTitle: typeof options.maxTitle === "number" && options.maxTitle > 0 ? options.maxTitle : 24,
-    scope: options.scope === "session" ? "session" : "run",
+    scope: options.scope === "session" || options.scope === "run" ? options.scope : null,
     persist: options.persist !== false,
     stateDirectory: typeof options.stateDirectory === "string" ? options.stateDirectory : null,
     guardSummary: options.guardSummary && typeof options.guardSummary === "object" ? options.guardSummary : null,
     now: typeof options.now === "function" ? options.now : null,
   };
+}
+
+/** One owner for config, per-call, and legacy idle-scope precedence. */
+export function resolveReportScope(options, requested, idle = false) {
+  if (requested === "run" || requested === "session") return requested;
+  if (options.scope === "run" || options.scope === "session") return options.scope;
+  return idle && options.rollup === false ? "session" : "run";
 }
 
 const pad = (s, w, right) => (right ? String(s).padStart(w) : String(s).padEnd(w));
@@ -143,15 +150,20 @@ export function formatTable(rows, opts = {}) {
     const t = String(s || "");
     return t.length > maxTitle ? t.slice(0, Math.max(1, maxTitle - 1)) + "…" : t;
   };
+  const modelLabel = (r) => {
+    const models = r.models instanceof Set ? [...r.models] : Array.isArray(r.models) ? r.models : r.model ? String(r.model).split(", ") : [];
+    return models.sort().join(", ");
+  };
   const cols = [
-    { key: "agent", head: "agent", right: false, val: (r) => "  ".repeat(r.depth || 0) + (r.agent || "?") },
-    { key: "title", head: "title", right: false, val: (r) => clip(r.title) },
+    { key: "agent", head: "agent / id", right: false, val: (r) => "  ".repeat(r.depth || 0) + (r.agent === "TOTAL" ? "TOTAL" : `${r.agent || "?"} [${r.shortID || "?"}]`) },
+    { key: "title", head: "title / model", right: false, val: (r) => `${clip(r.title)}${modelLabel(r) ? ` / ${modelLabel(r)}` : ""}` },
     { key: "in", head: "in", right: true, val: (r) => fmtTokens(r.input) },
     { key: "out", head: "out", right: true, val: (r) => fmtTokens(r.output) },
     { key: "cache", head: "cache r/w", right: true, val: (r) => `${fmtTokens(r.cacheRead)}/${fmtTokens(r.cacheWrite)}` },
+    { key: "budgetTokens", head: "budget tk", right: true, val: (r) => fmtTokens(r.totalTokens ?? ((r.input || 0) + (r.output || 0) + (r.reasoning || 0))) },
   ];
   if (opts.includeReasoning) cols.push({ key: "reason", head: "reason", right: true, val: (r) => fmtTokens(r.reasoning) });
-  cols.push({ key: "cost", head: "cost", right: true, val: (r) => r.costAvailable === false ? "unavailable" : fmtUsd(r.cost) });
+  cols.push({ key: "cost", head: "cost", right: true, val: (r) => r.costAvailable === false ? `>=${fmtUsd(r.costKnownLowerBound ?? r.cost)}` : fmtUsd(r.cost) });
   cols.push({ key: "time", head: "time", right: true, val: (r) => fmtDuration(r.ms) });
 
   const all = opts.total ? [...rows, { agent: "TOTAL", title: "", depth: 0, ...opts.total }] : rows;

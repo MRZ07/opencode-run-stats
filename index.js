@@ -8,6 +8,7 @@
  * function in a plugin file as a plugin, so helper logic lives in ./lib.js.
  */
 import { createTracker } from "./tracker.js";
+import { resolveReportScope } from "./lib.js";
 import { reportPathsFromTool, updateDeepReviewReport } from "./deep-review.js";
 import { projectKey, appendSubagentCheckpoints } from "./accounting.js";
 let z;
@@ -85,7 +86,7 @@ export const RunStats = async ({ client, directory }, options) => {
           await tracker.refresh();
           await tracker.refreshGuardConfig();
           const reportSession = requested || context.sessionID;
-          const result = await tracker.report(reportSession, args?.scope || "run");
+            const result = await tracker.report(reportSession, resolveReportScope(mergedOptions, args?.scope));
           return JSON.stringify(result, null, 2);
         },
       },
